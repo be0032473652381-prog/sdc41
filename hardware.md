@@ -60,7 +60,7 @@ recommendation, 10 kΩ on SDA and SCL to 3.3 V.
 | VDD, VDDH | tied together |
 | Power-up time | 1000 ms before commands accepted, after a hard reset |
 | I²C address | 0x62 |
-| CRC | mandatory on writes, poly 0x31, init 0xFF, no reflection |
+| CRC | mandatory on every two-byte data word, poly 0x31, init 0xFF, no reflection — **command words carry no CRC** |
 
 Permanent power is a deliberate simplification for this test harness — the
 goal is straightforward continuous read-out, not the power-cycled,

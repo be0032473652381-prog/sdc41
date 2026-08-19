@@ -57,8 +57,16 @@ repo must build and run entirely on its own.
 ## I²C protocol correctness
 
 The SCD41 requires a CRC-8 checksum (polynomial 0x31, initialisation 0xFF,
-no input/output reflection) on every write, and provides one on every read
-that the host may optionally verify. **This is the most error-prone part of
+no input/output reflection) on **every two-byte data word**, in either
+direction — a parameter being written, or a data word being read back.
+**Command words themselves carry no CRC.** A command-only write (for
+example `get_serial_number`, `0x3682`) is the two command bytes and nothing
+else; a write with a parameter is command bytes, then the data word, then
+its CRC; a read response is one CRC per data word returned. Appending a CRC
+byte after a bare command is itself a protocol violation, not a harmless
+extra byte — do not do it.
+
+**This is the most error-prone part of
 this project** — an incorrect CRC implementation typically fails silently
 (the sensor NAKs or returns stale/garbage data) rather than with a clear
 error, and looks identical to a wiring fault. Verify the CRC implementation

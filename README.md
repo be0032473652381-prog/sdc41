@@ -31,20 +31,10 @@ prompt for Codex CLI, scoped to `spec.md` and `hardware.md` as written.
 
 ## Quick start, once implemented
 
-```
-cd ~/projects/sdc41
-cmake -S . -B build
-cmake --build build -j4
-openocd -f interface/cmsis-dap.cfg -f target/rp2040.cfg -c "adapter speed 1000" -c "program build/sdc41.elf verify reset exit"
-picocom -b 115200 --omap crlf /dev/ttyACM0
-```
-
 Then `help` for the full command list.
 
 ---
 
 ## Open items
 
-- Board model and flash size not yet confirmed — see `hardware.md`.
-- GP8/GP9 assumed free for UART1 — confirm against the actual board.
-- SWD pin locations for this board not yet documented.
+None outstanding. Board, pins and flash confirmed.

@@ -33,7 +33,12 @@ Everything in `spec.md`, in full:
   this count; do not use any other figure from anywhere else, including
   this prompt's own prior wording.
 - I²C driver for the SCD41 at address 0x62, with a correctly implemented
-  CRC-8 (poly 0x31, init 0xFF, no reflection). Verify your implementation
+  CRC-8 (poly 0x31, init 0xFF, no reflection) on every two-byte data word —
+  **not on command words themselves**. A command-only write (e.g.
+  `get_serial_number`, `0x3682`) is the command bytes alone, nothing
+  appended. A write with a parameter is command, then data word, then its
+  CRC. A read response carries one CRC per data word returned. Verify your
+  implementation
   against the datasheet's own worked example, `CRC(0xBEEF) = 0x92`, before
   using it on any real command — report this check explicitly.
 - Periodic measurement mode as the boot default, single-shot mode available
