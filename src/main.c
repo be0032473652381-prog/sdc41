@@ -266,6 +266,98 @@ static void command_status(const char *args) {
     else console_printf(", data ready=error (%s)\r\n", sdc41_result_string(ready_result));
 }
 
+static void print_menu_value_error(sdc41_result_t result) {
+    console_printf("error (%s)\r\n", sdc41_result_string(result));
+}
+
+static void print_menu(void) {
+    bool ready = false;
+    sdc41_result_t ready_result = sdc41_get_ready(&ready);
+    sdc41_result_t measurement_result = SDC41_OK;
+    if (ready_result == SDC41_OK && ready) {
+        measurement_result = sdc41_read_measurement(&last_measurement);
+        if (measurement_result == SDC41_OK) have_measurement = true;
+    }
+
+    uint16_t serial_words[3] = {0};
+    bool asc = false;
+    uint16_t offset_raw = 0;
+    uint16_t altitude = 0;
+    sdc41_result_t serial_result;
+    sdc41_result_t asc_result;
+    sdc41_result_t offset_result;
+    sdc41_result_t altitude_result;
+    bool restart;
+    sdc41_result_t idle_result = enter_idle(&restart);
+    if (idle_result == SDC41_OK) {
+        serial_result = sdc41_get_serial(serial_words);
+        asc_result = sdc41_get_asc(&asc);
+        offset_result = sdc41_get_offset_raw(&offset_raw);
+        altitude_result = sdc41_get_altitude(&altitude);
+        leave_idle(restart);
+    } else {
+        serial_result = idle_result;
+        asc_result = idle_result;
+        offset_result = idle_result;
+        altitude_result = idle_result;
+    }
+
+    if (measurement_result != SDC41_OK) {
+        console_write("co2 = ");
+        print_menu_value_error(measurement_result);
+        console_write("temperature = ");
+        print_menu_value_error(measurement_result);
+        console_write("humidity = ");
+        print_menu_value_error(measurement_result);
+    } else if (!have_measurement) {
+        console_write("co2 = pending\r\n"
+                      "temperature = pending\r\n"
+                      "humidity = pending\r\n");
+    } else {
+        console_printf("co2 = %u ppm\r\n", last_measurement.co2_ppm);
+        console_write("temperature = ");
+        print_fixed_milli(last_measurement.temperature_milli_c, " C\r\n");
+        console_write("humidity = ");
+        print_fixed_milli((int32_t)last_measurement.humidity_milli_percent,
+                          " %RH\r\n");
+    }
+
+    console_write("serial = ");
+    if (serial_result == SDC41_OK) {
+        uint64_t serial = ((uint64_t)serial_words[0] << 32) |
+                          ((uint64_t)serial_words[1] << 16) | serial_words[2];
+        console_printf("%llu\r\n", (unsigned long long)serial);
+    } else {
+        print_menu_value_error(serial_result);
+    }
+    console_write("asc = ");
+    if (asc_result == SDC41_OK) console_printf("%s\r\n", asc ? "on" : "off");
+    else print_menu_value_error(asc_result);
+    console_write("offset = ");
+    if (offset_result == SDC41_OK) {
+        int32_t offset_milli =
+            (int32_t)(((uint64_t)offset_raw * 175000u) / 65536u);
+        print_fixed_milli(offset_milli, " C\r\n");
+    } else {
+        print_menu_value_error(offset_result);
+    }
+    console_write("altitude = ");
+    if (altitude_result == SDC41_OK) console_printf("%u m\r\n", altitude);
+    else print_menu_value_error(altitude_result);
+    console_printf("mode = %s\r\n", mode == MODE_PERIODIC ? "periodic" : "single");
+    console_write("data ready = ");
+    if (ready_result == SDC41_OK) console_printf("%s\r\n", ready ? "yes" : "no");
+    else print_menu_value_error(ready_result);
+}
+
+static void command_menu(const char *args) {
+    if (*args != '\0') {
+        console_write("rejected: menu takes no arguments; example: menu\r\n");
+        return;
+    }
+    print_menu();
+}
+
 static const char help_text[] =
     "commands:\r\n"
     "  co2                 example: co2\r\n"
@@ -277,6 +369,7 @@ static const char help_text[] =
     "  altitude [metres]   example: altitude 12\r\n"
     "  mode [periodic|single]  example: mode single\r\n"
     "  status              example: status\r\n"
+    "  menu                example: menu\r\n"
     "  help [command]      example: help offset\r\n"
     "note: ambient pressure can be set by the sensor protocol but cannot be read back; this harness has no pressure command.\r\n";
 
@@ -296,6 +389,7 @@ static void command_help(const char *args) {
         {"altitude", "altitude [metres]: read or set altitude from 0 to 3000 m. Example: altitude 12\r\n"},
         {"mode", "mode [periodic|single]: read or select measurement mode. Example: mode single\r\n"},
         {"status", "status: print mode, ASC, last reading, and data-ready state. Example: status\r\n"},
+        {"menu", "menu: print every readable parameter as key = value lines; selftest is deliberately excluded. Example: menu\r\n"},
         {"help", "help [command]: list commands or show one command in detail. Example: help offset\r\n"},
     };
     for (size_t i = 0; i < sizeof(details) / sizeof(details[0]); ++i) {
@@ -332,6 +426,7 @@ static void execute_line(char *line) {
     else if (strcmp(line, "altitude") == 0) command_altitude(args);
     else if (strcmp(line, "mode") == 0) command_mode(args);
     else if (strcmp(line, "status") == 0) command_status(args);
+    else if (strcmp(line, "menu") == 0) command_menu(args);
     else if (strcmp(line, "help") == 0) command_help(args);
     else console_printf("rejected: unknown command '%s'; type help for examples\r\n", line);
 }
@@ -361,6 +456,7 @@ int main(void) {
     sdc41_result_t result = sdc41_start_periodic();
     if (result == SDC41_OK) console_write("mode: periodic measurement started\r\n");
     else print_sensor_error("could not start periodic measurement", result);
+    print_menu();
     console_write("console ready; type help\r\n");
 
     char line[LINE_CAPACITY];
