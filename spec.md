@@ -139,30 +139,48 @@ existing boot power-up countdown. **Updates only when a genuine new sample
 arrives** (roughly every 5 s), not interpolated between polls — a debug tool
 should show what's actually true, not a smoothed guess at it.
 
-Once `filter = ready`, it stays `ready` for the rest of the session — the
-buffer doesn't need to refill from empty again; from that point on it's a
-genuine rolling 7-sample window, oldest sample dropped as each new one
-arrives.
+**This is a batch cycle, not a rolling window — it restarts every time.**
+The moment a batch of 7 completes, `co2` updates to that batch's filtered
+value and the buffer resets to empty. The very next raw sample belongs to a
+fresh batch: `filter` immediately begins counting down from 100% again
+(86% once that first new sample lands), and `co2` stays frozen at the value
+from the previous completed batch for the entire ~35 s the next batch takes
+to collect. `co2` therefore updates roughly once every 35 s, indefinitely,
+never more often — this is deliberate: a slower, more clearly-batched
+readout in exchange for every displayed value being a genuinely complete
+7-sample filter result, not a partially-warmed one.
 
-### Pipeline, per new raw reading
+At the instant a batch completes, `filter = ready` and the new `co2` value
+appear together — same event, so the operator can see the two are
+connected — before the countdown restarts on the next sample.
 
-1. Push the new raw `co2_ppm` into the 7-entry ring buffer.
-2. Once full: **median of 7** — sort a copy, take the middle value.
-3. **EMA on the median**, `alpha = 0.3`:
-   `ema = alpha * median + (1 - alpha) * ema_prev`. Seed `ema` with the
-   first median computed once the buffer first fills, not zero.
+### Pipeline, per completed batch of 7
 
-### What the operator sees, once ready
+1. Collect 7 raw `co2_ppm` readings into the buffer, one per real sensor
+   sample (~5 s apart). `filter` counts down as each arrives.
+2. Once the 7th arrives: **median of 7** — sort the batch, take the middle
+   value.
+3. **EMA across successive batch medians**, `alpha = 0.3`:
+   `ema = alpha * batch_median + (1 - alpha) * ema_prev`. Seed `ema` with
+   the first batch's median, not zero — the EMA smooths *between* batches,
+   not within one.
+4. Update `co2` to the new `ema` value. Reset the buffer to empty. The next
+   raw sample starts the next batch immediately; `filter` returns to 100%.
 
-`co2` shows the filtered (EMA) value. Also add `co2 raw` as its own field
-or command showing the most recent unfiltered reading — never hide the raw
-signal entirely in a debug harness; filtered-vs-raw comparison is how you
-confirm the filter is actually helping.
+### What the operator sees
+
+`co2` shows the filtered (EMA-across-batches) value, updating roughly every
+35 s. Also add `co2 raw` as its own field or command showing the most
+recent unfiltered single reading, updating every ~5 s regardless of batch
+state — never hide the raw signal entirely in a debug harness;
+filtered-vs-raw comparison is how you confirm the filter is actually
+helping.
 
 ### State
 
-Ring buffer (7× `uint16_t`), fill count (0–7), a `ready` flag, running EMA
-value — all in RAM, reset on boot.
+Ring buffer (7× `uint16_t`), fill count (0–7, reset to 0 every completed
+batch), running EMA value (persists *across* batch resets — only the raw
+sample buffer resets, not the EMA) — all in RAM, reset on boot.
 
 
 
