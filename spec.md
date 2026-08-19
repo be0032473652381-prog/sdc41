@@ -80,10 +80,24 @@ be between -20 and 40 degrees`, not a bare error code.
 
 ```
 power on
-wait 1000 ms (SCD41 power-up requirement)
+wait 1000 ms (SCD41 power-up requirement), printing progress every 100 ms
 start periodic measurement
 enter console loop
 ```
+
+While waiting, print a progress line every 100 ms — ten lines total across
+the window, not a single silent pause:
+
+```
+booting: SCD41 power-up, 900 ms remaining
+booting: SCD41 power-up, 800 ms remaining
+...
+booting: SCD41 power-up, 0 ms remaining
+```
+
+The first line prints at boot, immediately, showing the full 1000 ms
+remaining — not after the first 100 ms has already elapsed. The last line
+prints at 0 ms remaining, then periodic measurement starts.
 
 No console command may be issued before the 1000 ms power-up window has
 passed — if one arrives early, queue it or reject it with a clear message
