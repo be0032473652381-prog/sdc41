@@ -132,6 +132,35 @@ after boot — there is no separate toggle to turn it on or off in this
 version. (Open item: if this proves too noisy in practice, a `menu off` /
 `menu auto` toggle is a natural follow-up, not implemented here.)
 
+### Auto-refresh prints only changed fields
+
+The boot-time menu and any explicit `menu` command still print all nine
+fields, always — that is the operator's "show me everything now" path and
+must remain a complete, reliable dump.
+
+The **automatic** 3-second refresh is different: print a field's line only
+if its value has changed since the last time that field was printed
+(whether at boot, on an explicit `menu`, or on a previous auto-refresh).
+Unchanged fields print nothing that cycle.
+
+- If nothing at all changed since the last print, the cycle produces **no
+  output whatsoever** — not even a blank line. Silence is the expected,
+  correct result of no change.
+- Compare on the underlying value (the integer milli-degree, milli-percent,
+  ppm, or raw count), not on the formatted string — avoids any risk of a
+  rounding artifact in formatting being mistaken for a real change.
+- `co2`, `temperature`, `humidity` and `data ready` come from the same
+  measurement read and will typically change together, so they will usually
+  appear as a small cluster of lines each real refresh — this is expected
+  and does not need any separating marker between cycles.
+- No timestamps or delimiters are added between refresh cycles. Keep this
+  change scoped to suppressing unchanged lines; nothing else about the
+  format changes.
+
+Still no ANSI escape sequences, no cursor positioning, no fixed-screen
+redraw — this stays a plain scrolling log, per `AGENTS.md`, with fewer
+repeated lines rather than a different display mechanism.
+
 ```
 co2 = 612 ppm
 temperature = 23.4 C
