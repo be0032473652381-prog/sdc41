@@ -97,9 +97,40 @@ be between -20 and 40 degrees`, not a bare error code.
 
 ## The `menu` display
 
-Every parameter the SCD41 can report, in one plain-text dump. Exactly the
-same routine runs manually via `menu` and automatically once at the end of
-boot — one implementation, not two.
+Every parameter the SCD41 can report, in one plain-text dump. Runs once
+automatically at the end of boot, again on every manual `menu` command, and
+**auto-refreshes every 3 seconds while the console is idle.**
+
+### What refreshes every 3 seconds, and what does not
+
+Two categories, deliberately treated differently:
+
+| Field | Refreshed | Why |
+|---|---|---|
+| co2, temperature, humidity, mode, data ready | every 3 s | Available without leaving periodic measurement — no idle-mode round trip needed |
+| serial, asc, offset, altitude | **once**, at boot — then cached | Reading these requires stopping periodic measurement, the datasheet's mandatory 500 ms silence, reading, then restarting. Doing that every 3 s would continuously interrupt periodic measurement and never let it settle into its normal 5 s cadence. |
+
+The cached config fields are re-read and updated only when:
+
+- the operator runs `menu` explicitly, or
+- the operator changes one via `asc on/off`, `offset <°C>`, or
+  `altitude <m>` — that command's own set path already talks to the sensor,
+  so update the cached value from its result rather than triggering a
+  separate read.
+
+### Idle-only refresh, not mid-typing
+
+The 3-second auto-refresh **only fires when the console is at an empty
+prompt** — no partial command line pending. If the operator is mid-way
+through typing a command, suspend the refresh; resume the 3-second countdown
+from the next completed command or from the last keystroke, whichever is
+more recent. A refresh block appearing in the middle of a half-typed command
+would be confusing on a plain scrolling console with no redraw.
+
+This auto-refresh runs for the life of the session, not just a few cycles
+after boot — there is no separate toggle to turn it on or off in this
+version. (Open item: if this proves too noisy in practice, a `menu off` /
+`menu auto` toggle is a natural follow-up, not implemented here.)
 
 ```
 co2 = 612 ppm
