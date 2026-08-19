@@ -24,6 +24,32 @@ static measurement_mode_t mode = MODE_PERIODIC;
 static sdc41_measurement_t last_measurement;
 static bool have_measurement;
 
+typedef struct {
+    uint16_t serial_words[3];
+    bool asc;
+    uint16_t offset_raw;
+    uint16_t altitude;
+    sdc41_result_t serial_result;
+    sdc41_result_t asc_result;
+    sdc41_result_t offset_result;
+    sdc41_result_t altitude_result;
+} menu_config_cache_t;
+
+static menu_config_cache_t menu_config;
+
+typedef struct {
+    sdc41_result_t measurement_result;
+    bool have_measurement;
+    sdc41_measurement_t measurement;
+    menu_config_cache_t config;
+    measurement_mode_t mode;
+    sdc41_result_t ready_result;
+    bool ready;
+} menu_snapshot_t;
+
+static menu_snapshot_t last_printed_menu;
+static bool have_last_printed_menu;
+
 static void console_write(const char *text) {
     uart_puts(CONSOLE_UART, text);
 }
@@ -180,7 +206,13 @@ static void command_asc(const char *args) {
     sdc41_result_t result = setting ? sdc41_set_asc(requested) : sdc41_get_asc(&enabled);
     leave_idle(restart);
     if (result != SDC41_OK) print_sensor_error(setting ? "could not set ASC" : "could not read ASC", result);
-    else console_printf("asc: %s%s\r\n", setting ? "set " : "", (setting ? requested : enabled) ? "on" : "off");
+    else {
+        if (setting) {
+            menu_config.asc = requested;
+            menu_config.asc_result = SDC41_OK;
+        }
+        console_printf("asc: %s%s\r\n", setting ? "set " : "", (setting ? requested : enabled) ? "on" : "off");
+    }
 }
 
 static void command_offset(const char *args) {
@@ -198,6 +230,10 @@ static void command_offset(const char *args) {
         print_sensor_error(setting ? "could not set temperature offset" : "could not read temperature offset", result);
     } else {
         int32_t milli = (int32_t)(((uint64_t)raw * 175000u) / 65536u);
+        if (setting) {
+            menu_config.offset_raw = raw;
+            menu_config.offset_result = SDC41_OK;
+        }
         console_write(setting ? "offset: set " : "offset: ");
         print_fixed_milli(milli, " degrees C\r\n");
     }
@@ -216,7 +252,13 @@ static void command_altitude(const char *args) {
     sdc41_result_t result = setting ? sdc41_set_altitude(metres) : sdc41_get_altitude(&metres);
     leave_idle(restart);
     if (result != SDC41_OK) print_sensor_error(setting ? "could not set altitude" : "could not read altitude", result);
-    else console_printf("altitude: %s%u m\r\n", setting ? "set " : "", metres);
+    else {
+        if (setting) {
+            menu_config.altitude = metres;
+            menu_config.altitude_result = SDC41_OK;
+        }
+        console_printf("altitude: %s%u m\r\n", setting ? "set " : "", metres);
+    }
 }
 
 static void command_mode(const char *args) {
@@ -270,7 +312,44 @@ static void print_menu_value_error(sdc41_result_t result) {
     console_printf("error (%s)\r\n", sdc41_result_string(result));
 }
 
-static void print_menu(void) {
+static void refresh_menu_config(void) {
+    bool restart;
+    sdc41_result_t idle_result = enter_idle(&restart);
+    if (idle_result == SDC41_OK) {
+        menu_config.serial_result = sdc41_get_serial(menu_config.serial_words);
+        menu_config.asc_result = sdc41_get_asc(&menu_config.asc);
+        menu_config.offset_result =
+            sdc41_get_offset_raw(&menu_config.offset_raw);
+        menu_config.altitude_result =
+            sdc41_get_altitude(&menu_config.altitude);
+        leave_idle(restart);
+    } else {
+        menu_config.serial_result = idle_result;
+        menu_config.asc_result = idle_result;
+        menu_config.offset_result = idle_result;
+        menu_config.altitude_result = idle_result;
+    }
+}
+
+static bool measurement_field_changed(const menu_snapshot_t *current,
+                                      const menu_snapshot_t *previous,
+                                      int32_t current_value,
+                                      int32_t previous_value) {
+    return current->measurement_result != previous->measurement_result ||
+           current->have_measurement != previous->have_measurement ||
+           (current->measurement_result == SDC41_OK &&
+            current->have_measurement && current_value != previous_value);
+}
+
+static bool result_value_changed(sdc41_result_t current_result,
+                                 sdc41_result_t previous_result,
+                                 uint64_t current_value,
+                                 uint64_t previous_value) {
+    return current_result != previous_result ||
+           (current_result == SDC41_OK && current_value != previous_value);
+}
+
+static void print_menu(bool refresh_config, bool changed_only) {
     bool ready = false;
     sdc41_result_t ready_result = sdc41_get_ready(&ready);
     sdc41_result_t measurement_result = SDC41_OK;
@@ -279,75 +358,126 @@ static void print_menu(void) {
         if (measurement_result == SDC41_OK) have_measurement = true;
     }
 
-    uint16_t serial_words[3] = {0};
-    bool asc = false;
-    uint16_t offset_raw = 0;
-    uint16_t altitude = 0;
-    sdc41_result_t serial_result;
-    sdc41_result_t asc_result;
-    sdc41_result_t offset_result;
-    sdc41_result_t altitude_result;
-    bool restart;
-    sdc41_result_t idle_result = enter_idle(&restart);
-    if (idle_result == SDC41_OK) {
-        serial_result = sdc41_get_serial(serial_words);
-        asc_result = sdc41_get_asc(&asc);
-        offset_result = sdc41_get_offset_raw(&offset_raw);
-        altitude_result = sdc41_get_altitude(&altitude);
-        leave_idle(restart);
-    } else {
-        serial_result = idle_result;
-        asc_result = idle_result;
-        offset_result = idle_result;
-        altitude_result = idle_result;
-    }
+    if (refresh_config) refresh_menu_config();
 
-    if (measurement_result != SDC41_OK) {
+    menu_snapshot_t current = {
+        .measurement_result = measurement_result,
+        .have_measurement = have_measurement,
+        .measurement = last_measurement,
+        .config = menu_config,
+        .mode = mode,
+        .ready_result = ready_result,
+        .ready = ready,
+    };
+    bool all = !changed_only || !have_last_printed_menu;
+    bool co2_changed =
+        all || measurement_field_changed(&current, &last_printed_menu,
+                                         current.measurement.co2_ppm,
+                                         last_printed_menu.measurement.co2_ppm);
+    bool temperature_changed =
+        all || measurement_field_changed(
+                   &current, &last_printed_menu,
+                   current.measurement.temperature_milli_c,
+                   last_printed_menu.measurement.temperature_milli_c);
+    bool humidity_changed =
+        all || measurement_field_changed(
+                   &current, &last_printed_menu,
+                   (int32_t)current.measurement.humidity_milli_percent,
+                   (int32_t)last_printed_menu.measurement.humidity_milli_percent);
+
+    if (co2_changed) {
         console_write("co2 = ");
-        print_menu_value_error(measurement_result);
+        if (measurement_result != SDC41_OK)
+            print_menu_value_error(measurement_result);
+        else if (!have_measurement)
+            console_write("pending\r\n");
+        else
+            console_printf("%u ppm\r\n", last_measurement.co2_ppm);
+    }
+    if (temperature_changed) {
         console_write("temperature = ");
-        print_menu_value_error(measurement_result);
+        if (measurement_result != SDC41_OK)
+            print_menu_value_error(measurement_result);
+        else if (!have_measurement)
+            console_write("pending\r\n");
+        else
+            print_fixed_milli(last_measurement.temperature_milli_c, " C\r\n");
+    }
+    if (humidity_changed) {
         console_write("humidity = ");
-        print_menu_value_error(measurement_result);
-    } else if (!have_measurement) {
-        console_write("co2 = pending\r\n"
-                      "temperature = pending\r\n"
-                      "humidity = pending\r\n");
-    } else {
-        console_printf("co2 = %u ppm\r\n", last_measurement.co2_ppm);
-        console_write("temperature = ");
-        print_fixed_milli(last_measurement.temperature_milli_c, " C\r\n");
-        console_write("humidity = ");
-        print_fixed_milli((int32_t)last_measurement.humidity_milli_percent,
-                          " %RH\r\n");
+        if (measurement_result != SDC41_OK)
+            print_menu_value_error(measurement_result);
+        else if (!have_measurement)
+            console_write("pending\r\n");
+        else
+            print_fixed_milli((int32_t)last_measurement.humidity_milli_percent,
+                              " %RH\r\n");
     }
 
-    console_write("serial = ");
-    if (serial_result == SDC41_OK) {
-        uint64_t serial = ((uint64_t)serial_words[0] << 32) |
-                          ((uint64_t)serial_words[1] << 16) | serial_words[2];
-        console_printf("%llu\r\n", (unsigned long long)serial);
-    } else {
-        print_menu_value_error(serial_result);
+    uint64_t serial = ((uint64_t)menu_config.serial_words[0] << 32) |
+                      ((uint64_t)menu_config.serial_words[1] << 16) |
+                      menu_config.serial_words[2];
+    uint64_t previous_serial =
+        ((uint64_t)last_printed_menu.config.serial_words[0] << 32) |
+        ((uint64_t)last_printed_menu.config.serial_words[1] << 16) |
+        last_printed_menu.config.serial_words[2];
+    if (all || result_value_changed(menu_config.serial_result,
+                                    last_printed_menu.config.serial_result,
+                                    serial, previous_serial)) {
+        console_write("serial = ");
+        if (menu_config.serial_result == SDC41_OK)
+            console_printf("%llu\r\n", (unsigned long long)serial);
+        else
+            print_menu_value_error(menu_config.serial_result);
     }
-    console_write("asc = ");
-    if (asc_result == SDC41_OK) console_printf("%s\r\n", asc ? "on" : "off");
-    else print_menu_value_error(asc_result);
-    console_write("offset = ");
-    if (offset_result == SDC41_OK) {
-        int32_t offset_milli =
-            (int32_t)(((uint64_t)offset_raw * 175000u) / 65536u);
-        print_fixed_milli(offset_milli, " C\r\n");
-    } else {
-        print_menu_value_error(offset_result);
+    if (all || result_value_changed(menu_config.asc_result,
+                                    last_printed_menu.config.asc_result,
+                                    menu_config.asc,
+                                    last_printed_menu.config.asc)) {
+        console_write("asc = ");
+        if (menu_config.asc_result == SDC41_OK)
+            console_printf("%s\r\n", menu_config.asc ? "on" : "off");
+        else
+            print_menu_value_error(menu_config.asc_result);
     }
-    console_write("altitude = ");
-    if (altitude_result == SDC41_OK) console_printf("%u m\r\n", altitude);
-    else print_menu_value_error(altitude_result);
-    console_printf("mode = %s\r\n", mode == MODE_PERIODIC ? "periodic" : "single");
-    console_write("data ready = ");
-    if (ready_result == SDC41_OK) console_printf("%s\r\n", ready ? "yes" : "no");
-    else print_menu_value_error(ready_result);
+    if (all || result_value_changed(menu_config.offset_result,
+                                    last_printed_menu.config.offset_result,
+                                    menu_config.offset_raw,
+                                    last_printed_menu.config.offset_raw)) {
+        console_write("offset = ");
+        if (menu_config.offset_result == SDC41_OK) {
+            int32_t offset_milli = (int32_t)(
+                ((uint64_t)menu_config.offset_raw * 175000u) / 65536u);
+            print_fixed_milli(offset_milli, " C\r\n");
+        } else {
+            print_menu_value_error(menu_config.offset_result);
+        }
+    }
+    if (all || result_value_changed(menu_config.altitude_result,
+                                    last_printed_menu.config.altitude_result,
+                                    menu_config.altitude,
+                                    last_printed_menu.config.altitude)) {
+        console_write("altitude = ");
+        if (menu_config.altitude_result == SDC41_OK)
+            console_printf("%u m\r\n", menu_config.altitude);
+        else
+            print_menu_value_error(menu_config.altitude_result);
+    }
+    if (all || mode != last_printed_menu.mode)
+        console_printf("mode = %s\r\n",
+                       mode == MODE_PERIODIC ? "periodic" : "single");
+    if (all || result_value_changed(ready_result,
+                                    last_printed_menu.ready_result, ready,
+                                    last_printed_menu.ready)) {
+        console_write("data ready = ");
+        if (ready_result == SDC41_OK)
+            console_printf("%s\r\n", ready ? "yes" : "no");
+        else
+            print_menu_value_error(ready_result);
+    }
+
+    last_printed_menu = current;
+    have_last_printed_menu = true;
 }
 
 static void command_menu(const char *args) {
@@ -355,7 +485,7 @@ static void command_menu(const char *args) {
         console_write("rejected: menu takes no arguments; example: menu\r\n");
         return;
     }
-    print_menu();
+    print_menu(true, false);
 }
 
 static const char help_text[] =
@@ -389,7 +519,7 @@ static void command_help(const char *args) {
         {"altitude", "altitude [metres]: read or set altitude from 0 to 3000 m. Example: altitude 12\r\n"},
         {"mode", "mode [periodic|single]: read or select measurement mode. Example: mode single\r\n"},
         {"status", "status: print mode, ASC, last reading, and data-ready state. Example: status\r\n"},
-        {"menu", "menu: print every readable parameter as key = value lines; selftest is deliberately excluded. Example: menu\r\n"},
+        {"menu", "menu: print every readable parameter as key = value lines and refresh cached configuration; changed fields auto-refresh every 3 seconds while the console is idle. Selftest is deliberately excluded. Example: menu\r\n"},
         {"help", "help [command]: list commands or show one command in detail. Example: help offset\r\n"},
     };
     for (size_t i = 0; i < sizeof(details) / sizeof(details[0]); ++i) {
@@ -456,44 +586,50 @@ int main(void) {
     sdc41_result_t result = sdc41_start_periodic();
     if (result == SDC41_OK) console_write("mode: periodic measurement started\r\n");
     else print_sensor_error("could not start periodic measurement", result);
-    print_menu();
+    print_menu(true, false);
     console_write("console ready; type help\r\n");
 
     char line[LINE_CAPACITY];
     size_t length = 0;
     bool ignored_lf = false;
+    absolute_time_t refresh_deadline = make_timeout_time_ms(3000);
     while (true) {
-        if (!uart_is_readable(CONSOLE_UART)) {
-            tight_loop_contents();
-            continue;
-        }
-        char ch = (char)uart_getc(CONSOLE_UART);
-        if (ch == '\r' || ch == '\n') {
-            if (ch == '\n' && ignored_lf) {
+        if (uart_is_readable(CONSOLE_UART)) {
+            char ch = (char)uart_getc(CONSOLE_UART);
+            if (ch == '\r' || ch == '\n') {
+                if (ch == '\n' && ignored_lf) {
+                    ignored_lf = false;
+                    refresh_deadline = make_timeout_time_ms(3000);
+                    continue;
+                }
+                ignored_lf = ch == '\r';
+                console_write("\r\n");
+                line[length] = '\0';
+                execute_line(line);
+                length = 0;
+            } else {
                 ignored_lf = false;
-                continue;
+                if (ch == '\b' || ch == 0x7f) {
+                    if (length > 0) {
+                        --length;
+                        console_write("\b \b");
+                    }
+                } else if (isprint((unsigned char)ch)) {
+                    if (length + 1 < sizeof(line)) {
+                        line[length++] = ch;
+                        uart_putc_raw(CONSOLE_UART, ch);
+                    } else {
+                        console_write("\r\nrejected: command is too long; maximum is 95 characters\r\n");
+                        length = 0;
+                    }
+                }
             }
-            ignored_lf = ch == '\r';
-            console_write("\r\n");
-            line[length] = '\0';
-            execute_line(line);
-            length = 0;
+            refresh_deadline = make_timeout_time_ms(3000);
+        } else if (length == 0 && time_reached(refresh_deadline)) {
+            print_menu(false, true);
+            refresh_deadline = make_timeout_time_ms(3000);
         } else {
-            ignored_lf = false;
-            if (ch == '\b' || ch == 0x7f) {
-                if (length > 0) {
-                    --length;
-                    console_write("\b \b");
-                }
-            } else if (isprint((unsigned char)ch)) {
-                if (length + 1 < sizeof(line)) {
-                    line[length++] = ch;
-                    uart_putc_raw(CONSOLE_UART, ch);
-                } else {
-                    console_write("\r\nrejected: command is too long; maximum is 95 characters\r\n");
-                    length = 0;
-                }
-            }
+            tight_loop_contents();
         }
     }
 }
