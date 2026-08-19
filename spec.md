@@ -37,14 +37,32 @@ This harness must expose all of the following, not just CO₂:
 | Serial number | `get_serial_number` | 48-bit, one-off identity read |
 | Self-test result | `perform_self_test` | pass/fail, takes up to 10 s |
 | ASC enabled state | `get_automatic_self_calibration_enabled` | on/off |
-| Temperature offset | `get_temperature_offset` | °C, affects RH/T only, not CO₂ |
-| Sensor altitude | `get_sensor_altitude` | metres, for pressure compensation |
+| Temperature offset | `get_temperature_offset` | °C, affects RH/T only, not CO₂ — see range note below |
+| Sensor altitude | `get_sensor_altitude` | metres, for pressure compensation — see range note below |
 | Data-ready status | `get_data_ready_status` | whether a new reading is available |
 
 **Ambient pressure has a set command in the SCD41 protocol but no
 corresponding get command** — it cannot be read back once written. Do not
 implement a `pressure` read command; note this limitation in `help` if the
 command is referenced.
+
+**Temperature offset range: 0 to 20 °C.** The protocol encodes this field as
+`word = offset × 65536 / 175` on an **unsigned** 16-bit value — a negative
+offset has no valid encoding and must be rejected, not clamped or silently
+made positive. 20 °C is the practical upper bound; the field can technically
+carry a much larger raw value, but do not accept anything the datasheet does
+not describe as a sensible offset. Reject outside 0–20 with a plain-language
+reason.
+
+**Sensor altitude range: 0 to 3000 m.** Reject outside this range with a
+plain-language reason.
+
+*(These two range figures come from Codex's own reading of the datasheet
+during implementation, cross-checked here only for the encoding constraint —
+the 0 lower bound on offset — which is independently verifiable from the
+formula above. If either upper bound turns out wrong once the datasheet is
+checked directly, correct it here rather than silently overriding it in
+code.)*
 
 ---
 
