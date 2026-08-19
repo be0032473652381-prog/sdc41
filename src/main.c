@@ -584,8 +584,12 @@ int main(void) {
     }
     console_write("crc self-check: passed; CRC(0xBEEF) = 0x92\r\n");
     sdc41_result_t result = sdc41_start_periodic();
-    if (result == SDC41_OK) console_write("mode: periodic measurement started\r\n");
-    else print_sensor_error("could not start periodic measurement", result);
+    if (result == SDC41_OK) {
+        console_write("mode: periodic measurement started\r\n");
+        sleep_ms(500);
+    } else {
+        print_sensor_error("could not start periodic measurement", result);
+    }
     print_menu(true, false);
     console_write("console ready; type help\r\n");
 
