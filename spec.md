@@ -88,7 +88,83 @@ be between -20 and 40 degrees`, not a bare error code.
 
 ---
 
-## The `menu` display
+## CO₂ filtering — median + EMA
+
+The sensor already self-compensates every reading for temperature and
+humidity on-chip via its own SHT4x — no host-side T/RH correction exists or
+is added here. This section is about smoothing sample-to-sample noise, not
+compensation.
+
+Temperature and humidity display continues exactly as before, immediately,
+unfiltered. Only `co2` is affected by anything in this section — that scope
+is deliberate; nothing else was reported as unreliable.
+
+### Sample collection — decoupled from display
+
+A 7-sample median needs seven genuine sensor readings, roughly 30–35 s at
+the SCD41's native periodic cadence (~5 s in high-performance mode; not
+configurable down to 2 s in this mode). The filter runs on its **own poll
+loop**, checking `data_ready` frequently (every ~1 s is enough to never
+miss a reading), independent of the 5-second **display** refresh.
+
+### The `co2` reading is withheld until the filter is fully warmed up
+
+Unlike the earlier design, **no `co2` value is shown at all until the
+7-sample ring buffer is completely full.** A partial-buffer median hasn't
+had the chance to reject an outlier the way a true 7-sample median can, and
+showing one anyway would undermine the entire point of adding the filter.
+`co2` stays `pending` for the whole warm-up period, exactly as it already
+does for the first few seconds before boot — just for longer, and with a
+visible reason why.
+
+### Warm-up progress field — `filter`, not `data ready`
+
+A new field, distinctly named to avoid colliding with the existing
+`data ready` (per-reading sensor flag, unaffected by any of this):
+
+```
+filter = 100%
+filter = 86%
+filter = 71%
+filter = 57%
+filter = 43%
+filter = 29%
+filter = 14%
+filter = ready
+```
+
+Eight discrete states — 0 through 7 samples collected, `100 - (n/7)*100`,
+rounded — counting down as each real sample arrives, styled the same as the
+existing boot power-up countdown. **Updates only when a genuine new sample
+arrives** (roughly every 5 s), not interpolated between polls — a debug tool
+should show what's actually true, not a smoothed guess at it.
+
+Once `filter = ready`, it stays `ready` for the rest of the session — the
+buffer doesn't need to refill from empty again; from that point on it's a
+genuine rolling 7-sample window, oldest sample dropped as each new one
+arrives.
+
+### Pipeline, per new raw reading
+
+1. Push the new raw `co2_ppm` into the 7-entry ring buffer.
+2. Once full: **median of 7** — sort a copy, take the middle value.
+3. **EMA on the median**, `alpha = 0.3`:
+   `ema = alpha * median + (1 - alpha) * ema_prev`. Seed `ema` with the
+   first median computed once the buffer first fills, not zero.
+
+### What the operator sees, once ready
+
+`co2` shows the filtered (EMA) value. Also add `co2 raw` as its own field
+or command showing the most recent unfiltered reading — never hide the raw
+signal entirely in a debug harness; filtered-vs-raw comparison is how you
+confirm the filter is actually helping.
+
+### State
+
+Ring buffer (7× `uint16_t`), fill count (0–7), a `ready` flag, running EMA
+value — all in RAM, reset on boot.
+
+
 
 Every parameter the SCD41 can report, in one plain-text dump. Runs once
 automatically at the end of boot, again on every manual `menu` command, and
