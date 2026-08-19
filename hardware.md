@@ -8,13 +8,14 @@ What is physically connected. Config-only — behaviour is in `spec.md`.
 
 | | |
 |---|---|
-| MCU board | RP2040-based development board — **model not yet specified** |
-| Flash size | not yet confirmed — check board silkscreen/datasheet before setting `PICO_FLASH_SIZE_BYTES` |
+| MCU board | YD-RP2040 |
+| Silicon | RP2040-B2 |
+| Flash | 16 MB, Zbit zb25vq128 |
 | SWD adapter speed | 1000 kHz, drop to 100 kHz if the link is unreliable |
 
-This is deliberately a different physical board from the one used in
-`luftfugl-motor`. Do not assume flash size, silicon revision, or onboard
-peripherals match that project.
+A separate physical unit from the board used in `luftfugl-motor`, same model.
+Flash size and silicon revision confirmed — do not assume other onboard
+peripherals or wiring match that unit; this board is wired independently.
 
 ---
 
@@ -27,15 +28,16 @@ peripherals match that project.
 | GP8 | Debug probe UART RX | UART1 TX | out |
 | GP9 | Debug probe UART TX | UART1 RX | in |
 
-UART1 is placed on GP8/GP9 rather than GP0/GP1 or any pins adjacent to the
-I²C bus, to avoid the TX/RX coupling problem encountered on a similarly
-laid-out board in `luftfugl-motor`. Confirm GP8/GP9 are free on the actual
-board in use before wiring — if they are already committed to something
-else, choose a different UART1-capable pair, not GP0/GP1.
+GP8/GP9 confirmed free on this board. UART1 placed here rather than GP0/GP1
+to avoid the TX/RX coupling problem encountered on a similarly laid-out
+board in `luftfugl-motor`.
 
-SWDIO/SWCLK are the board's dedicated debug pins, wherever they are broken
-out on this specific board — not yet documented here since the board model
-is unconfirmed.
+### Debug — SWD
+
+SWDIO and SWCLK are dedicated RP2040 package pins, broken out on the
+YD-RP2040's 4-pin header marked `3V3 / GND / SWCLK / SWIO`. Connect SWCLK,
+SWIO and GND to the Debug Probe. **Do not connect 3V3** — this board is
+separately powered.
 
 ---
 
@@ -46,8 +48,7 @@ is unconfirmed.
 | SCD41 | 0x62 | 100 kHz |
 
 Single device on this bus. Pull-ups per the SCD41 datasheet's own
-recommendation, 10 kΩ on SDA and SCL to 3.3 V — no other device sharing the
-bus to justify a different value.
+recommendation, 10 kΩ on SDA and SCL to 3.3 V.
 
 ---
 
@@ -63,9 +64,7 @@ bus to justify a different value.
 
 Permanent power is a deliberate simplification for this test harness — the
 goal is straightforward continuous read-out, not the power-cycled,
-battery-optimised behaviour `luftfugl-motor` will eventually need. That
-behaviour, when it's time to integrate, is a separate mode to add, not the
-default here.
+battery-optimised behaviour `luftfugl-motor` will eventually need.
 
 ---
 
@@ -79,10 +78,14 @@ default here.
 
 ---
 
+## Build and flash
+
+```
+cmake -S . -B build
+cmake --build build -j4
+openocd -f interface/cmsis-dap.cfg -f target/rp2040.cfg -c "adapter speed 1000" -c "program build/sdc41.elf verify reset exit"
+```
+
 ## Open items
 
-- Exact board model and its flash size — confirm before writing
-  `PICO_FLASH_SIZE_BYTES` or any board-specific config.
-- Confirm GP8/GP9 are genuinely free on the board in hand before wiring UART1
-  there.
-- SWD pin locations on this specific board — not yet documented.
+None outstanding. Board, pins and flash confirmed.
