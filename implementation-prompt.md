@@ -28,8 +28,10 @@ Producing `build/sdc41.elf`.
 Everything in `spec.md`, in full:
 
 - Boot sequence with the 100 ms progress reporting during the 1000 ms
-  power-up wait, exactly as specified — ten lines, first at full 1000 ms
-  remaining, last at 0.
+  power-up wait, exactly as specified in `spec.md` — eleven lines, 1000 ms
+  down to 0 ms inclusive in steps of 100. `spec.md` is authoritative for
+  this count; do not use any other figure from anywhere else, including
+  this prompt's own prior wording.
 - I²C driver for the SCD41 at address 0x62, with a correctly implemented
   CRC-8 (poly 0x31, init 0xFF, no reflection). Verify your implementation
   against the datasheet's own worked example, `CRC(0xBEEF) = 0x92`, before
