@@ -85,19 +85,23 @@ start periodic measurement
 enter console loop
 ```
 
-While waiting, print a progress line every 100 ms — ten lines total across
-the window, not a single silent pause:
+While waiting, print a progress line every 100 ms, **inclusive of both
+ends** — the first line at the very start of the wait, the last at the
+moment it completes:
 
 ```
+booting: SCD41 power-up, 1000 ms remaining
 booting: SCD41 power-up, 900 ms remaining
 booting: SCD41 power-up, 800 ms remaining
 ...
+booting: SCD41 power-up, 100 ms remaining
 booting: SCD41 power-up, 0 ms remaining
 ```
 
-The first line prints at boot, immediately, showing the full 1000 ms
-remaining — not after the first 100 ms has already elapsed. The last line
-prints at 0 ms remaining, then periodic measurement starts.
+That is **eleven lines** in total — 1000 down to 0 in steps of 100,
+including both endpoints. The first line prints immediately at boot, before
+any time has elapsed. The last line prints the moment the wait completes,
+then periodic measurement starts.
 
 No console command may be issued before the 1000 ms power-up window has
 passed — if one arrives early, queue it or reject it with a clear message
