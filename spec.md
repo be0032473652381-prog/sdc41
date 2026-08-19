@@ -40,6 +40,7 @@ This harness must expose all of the following, not just CO₂:
 | Temperature offset | `get_temperature_offset` | °C, affects RH/T only, not CO₂ — see range note below |
 | Sensor altitude | `get_sensor_altitude` | metres, for pressure compensation — see range note below |
 | Data-ready status | `get_data_ready_status` | whether a new reading is available |
+| I²C address | — | fixed, compiled constant (0x62); not a sensor read — see below |
 
 **Ambient pressure has a set command in the SCD41 protocol but no
 corresponding get command** — a hardware limitation, not something a
@@ -91,16 +92,17 @@ be between -20 and 40 degrees`, not a bare error code.
 
 Every parameter the SCD41 can report, in one plain-text dump. Runs once
 automatically at the end of boot, again on every manual `menu` command, and
-**auto-refreshes every 3 seconds while the console is idle.**
+**auto-refreshes every 5 seconds while the console is idle**, matching the SCD41's own periodic measurement cadence so the refresh more often lands right after a fresh reading rather than between them.
 
-### What refreshes every 3 seconds, and what does not
+### What refreshes every 5 seconds, and what does not
 
 Two categories, deliberately treated differently:
 
 | Field | Refreshed | Why |
 |---|---|---|
-| co2, temperature, humidity, mode | every 3 s | Available without leaving periodic measurement — no idle-mode round trip needed |
-| serial, asc, offset, altitude | **once**, at boot — then cached | Reading these requires stopping periodic measurement, the datasheet's mandatory 500 ms silence, reading, then restarting. Doing that every 3 s would continuously interrupt periodic measurement. |
+| co2, temperature, humidity, mode | every 5 s | Available without leaving periodic measurement — no idle-mode round trip needed |
+| serial, asc, offset, altitude | **once**, at boot — then cached | Reading these requires stopping periodic measurement, the datasheet's mandatory 500 ms silence, reading, then restarting. Doing that every 5 s would continuously interrupt periodic measurement. |
+| i2c address | **never** — compiled constant | Not read from the sensor at all; it's the fixed address (0x62) this firmware is built to talk to. Printed once at boot, never changes for the life of the firmware. |
 
 `data ready` is excluded from the auto-refresh — it flips true/false on its
 own cadence independent of the other fields and was the dominant source of
@@ -116,9 +118,9 @@ The cached config fields are re-read and updated only when:
 
 ### Idle-only refresh, not mid-typing
 
-The 3-second auto-refresh **only fires when the console is at an empty
+The 5-second auto-refresh **only fires when the console is at an empty
 prompt** — no partial command line pending. If the operator is mid-way
-through typing a command, suspend the refresh; resume the 3-second countdown
+through typing a command, suspend the refresh; resume the 5-second countdown
 from the next completed command or from the last keystroke, whichever is
 more recent. A refresh block appearing in the middle of a half-typed command
 would be confusing on a plain scrolling console with no redraw.
@@ -134,7 +136,7 @@ The boot-time menu and any explicit `menu` command still print all nine
 fields, always — that is the operator's "show me everything now" path and
 must remain a complete, reliable dump.
 
-The **automatic** 3-second refresh is different: print a field's line only
+The **automatic** 5-second refresh is different: print a field's line only
 if its value has changed since the last time that field was printed
 (whether at boot, on an explicit `menu`, or on a previous auto-refresh).
 Unchanged fields print nothing that cycle.
