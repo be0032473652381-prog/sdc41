@@ -86,11 +86,56 @@ must be typeable exactly as shown.
 | `mode` | `mode` | Print current measurement mode |
 | `mode periodic` / `mode single` | `mode single` | Switch measurement mode |
 | `status` | `status` | Mode, ASC state, last reading, data-ready state, in one summary |
+| `menu` | `menu` | Print every readable parameter, one per line, key = value |
 | `help` | `help` | List every command with an example |
 | `help <cmd>` | `help offset` | Detail for one command |
 
 Rejections must say what was wrong, in plain words — `rejected: offset must
 be between -20 and 40 degrees`, not a bare error code.
+
+---
+
+## The `menu` display
+
+Every parameter the SCD41 can report, in one plain-text dump. Exactly the
+same routine runs manually via `menu` and automatically once at the end of
+boot — one implementation, not two.
+
+```
+co2 = 612 ppm
+temperature = 23.4 C
+humidity = 41.2 %RH
+serial = 273325796834238
+asc = on
+offset = 4.500 C
+altitude = 0 m
+mode = periodic
+data ready = yes
+```
+
+Format: `key = value`, one per line, CRLF, no alignment padding required.
+Units included on the same line as the value, not in a separate column.
+
+**`selftest` is deliberately excluded** from `menu` — it blocks for ~10 s and
+interrupts measurement. Running it on every boot or every manual `menu` call
+would make the display unusable to watch. It remains available only as its
+own explicit command.
+
+**Immediately after boot, CO₂/temperature/humidity may not be ready yet** —
+periodic measurement has only just started and the first reading can take
+up to 5 s. Print `pending` for those three fields rather than blocking boot
+to wait for them:
+
+```
+co2 = pending
+temperature = pending
+humidity = pending
+serial = 273325796834238
+...
+```
+
+The other fields (serial, ASC, offset, altitude, mode) are always available
+immediately and print real values even on the very first boot call.
 
 ---
 
@@ -100,6 +145,7 @@ be between -20 and 40 degrees`, not a bare error code.
 power on
 wait 1000 ms (SCD41 power-up requirement), printing progress every 100 ms
 start periodic measurement
+print the menu display, once (see "The menu display" above)
 enter console loop
 ```
 
