@@ -42,27 +42,19 @@ This harness must expose all of the following, not just CO₂:
 | Data-ready status | `get_data_ready_status` | whether a new reading is available |
 
 **Ambient pressure has a set command in the SCD41 protocol but no
-corresponding get command** — it cannot be read back once written. Do not
-implement a `pressure` read command; note this limitation in `help` if the
-command is referenced.
+corresponding get command** — a hardware limitation, not something a
+`pressure` command could work around either way.
 
-**Temperature offset range: 0 to 20 °C.** The protocol encodes this field as
-`word = offset × 65536 / 175` on an **unsigned** 16-bit value — a negative
-offset has no valid encoding and must be rejected, not clamped or silently
-made positive. 20 °C is the practical upper bound; the field can technically
-carry a much larger raw value, but do not accept anything the datasheet does
-not describe as a sensible offset. Reject outside 0–20 with a plain-language
-reason.
+**Temperature offset field: unsigned 16-bit**, `word = offset × 65536 / 175`.
+Negative values have no bit pattern to encode them into — reject negative
+input, not because of a policy limit but because there's nothing to send.
+Positive values up to the field's full width (~174.99 °C) are all
+representable; no artificial ceiling below that.
 
-**Sensor altitude range: 0 to 3000 m.** Reject outside this range with a
-plain-language reason.
-
-*(These two range figures come from Codex's own reading of the datasheet
-during implementation, cross-checked here only for the encoding constraint —
-the 0 lower bound on offset — which is independently verifiable from the
-formula above. If either upper bound turns out wrong once the datasheet is
-checked directly, correct it here rather than silently overriding it in
-code.)*
+**Sensor altitude field: unsigned 16-bit, 0 to 65535 m.** No range
+restriction beyond what the field can hold — accuracy of the pressure
+compensation at extreme values is a data-quality question, not a protocol
+one, and this is a debug harness for exploring exactly that kind of thing.
 
 ---
 
@@ -107,8 +99,12 @@ Two categories, deliberately treated differently:
 
 | Field | Refreshed | Why |
 |---|---|---|
-| co2, temperature, humidity, mode, data ready | every 3 s | Available without leaving periodic measurement — no idle-mode round trip needed |
-| serial, asc, offset, altitude | **once**, at boot — then cached | Reading these requires stopping periodic measurement, the datasheet's mandatory 500 ms silence, reading, then restarting. Doing that every 3 s would continuously interrupt periodic measurement and never let it settle into its normal 5 s cadence. |
+| co2, temperature, humidity, mode | every 3 s | Available without leaving periodic measurement — no idle-mode round trip needed |
+| serial, asc, offset, altitude | **once**, at boot — then cached | Reading these requires stopping periodic measurement, the datasheet's mandatory 500 ms silence, reading, then restarting. Doing that every 3 s would continuously interrupt periodic measurement. |
+
+`data ready` is excluded from the auto-refresh — it flips true/false on its
+own cadence independent of the other fields and was the dominant source of
+scroll noise. It still appears in the boot-time and manual `menu` dumps.
 
 The cached config fields are re-read and updated only when:
 
