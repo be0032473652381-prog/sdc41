@@ -90,11 +90,7 @@ sdc41_result_t sdc41_start_periodic(void) {
 }
 
 sdc41_result_t sdc41_stop_periodic(void) {
-    sdc41_result_t result = write_command(CMD_STOP_PERIODIC);
-    if (result == SDC41_OK) {
-        sleep_ms(500);
-    }
-    return result;
+    return write_command(CMD_STOP_PERIODIC);
 }
 
 sdc41_result_t sdc41_measure_single_shot(void) {

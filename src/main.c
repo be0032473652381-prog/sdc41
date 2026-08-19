@@ -83,7 +83,12 @@ static void print_measurement(const sdc41_measurement_t *measurement) {
 
 static sdc41_result_t enter_idle(bool *restart_periodic) {
     *restart_periodic = mode == MODE_PERIODIC;
-    return *restart_periodic ? sdc41_stop_periodic() : SDC41_OK;
+    if (*restart_periodic) {
+        sdc41_result_t result = sdc41_stop_periodic();
+        if (result == SDC41_OK) sleep_ms(500);
+        return result;
+    }
+    return SDC41_OK;
 }
 
 static void leave_idle(bool restart_periodic) {
@@ -351,7 +356,9 @@ static bool result_value_changed(sdc41_result_t current_result,
 
 static void print_menu(bool refresh_config, bool changed_only) {
     bool ready = false;
+    console_write("checkpoint B\r\n");
     sdc41_result_t ready_result = sdc41_get_ready(&ready);
+    console_write("checkpoint C\r\n");
     sdc41_result_t measurement_result = SDC41_OK;
     if (ready_result == SDC41_OK && ready) {
         measurement_result = sdc41_read_measurement(&last_measurement);
@@ -586,10 +593,9 @@ int main(void) {
     sdc41_result_t result = sdc41_start_periodic();
     if (result == SDC41_OK) {
         console_write("mode: periodic measurement started\r\n");
-        sleep_ms(500);
-    } else {
-        print_sensor_error("could not start periodic measurement", result);
+        console_write("checkpoint A\r\n");
     }
+    else print_sensor_error("could not start periodic measurement", result);
     print_menu(true, false);
     console_write("console ready; type help\r\n");
 
