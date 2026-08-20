@@ -13,9 +13,9 @@ What is physically connected. Config-only — behaviour is in `spec.md`.
 | Flash | 16 MB, Zbit zb25vq128 |
 | SWD adapter speed | 1000 kHz, drop to 100 kHz if the link is unreliable |
 
-A separate physical unit from the board used in `luftfugl-motor`, same model.
-Flash size and silicon revision confirmed — do not assume other onboard
-peripherals or wiring match that unit; this board is wired independently.
+YD-RP2040, RP2040-B2 silicon, 16 MB flash, confirmed by SFDP read once the
+SWD link was stable. This board is wired independently of anything else —
+no assumption about other boards' wiring applies here.
 
 ---
 
@@ -29,8 +29,9 @@ peripherals or wiring match that unit; this board is wired independently.
 | GP9 | Debug probe UART TX | UART1 RX | in |
 
 GP8/GP9 confirmed free on this board. UART1 placed here rather than GP0/GP1
-to avoid the TX/RX coupling problem encountered on a similarly laid-out
-board in `luftfugl-motor`.
+deliberately — adjacent TX/RX pins on this package are a known coupling
+risk (transmitted output bleeding back into the receiver), and GP8/GP9 are
+physically separated on the header.
 
 ### Debug — SWD
 
@@ -56,15 +57,19 @@ recommendation, 10 kΩ on SDA and SCL to 3.3 V.
 
 | | |
 |---|---|
-| Supply | 3.3 V, permanent — no power switching in this harness |
+| Supply | 3.3 V, permanent wiring — no physical switch on this board |
 | VDD, VDDH | tied together |
 | Power-up time | 1000 ms before commands accepted, after a hard reset |
 | I²C address | 0x62 |
 | CRC | mandatory on every two-byte data word, poly 0x31, init 0xFF, no reflection — **command words carry no CRC** |
+| `power_down` | `0x36e0`, max 1 ms — sensor must be idle first |
+| `wake_up` | `0x36f6`, max 20 ms — **the sensor never ACKs this command; do not treat a missing ACK as a write failure for this specific call** |
 
-Permanent power is a deliberate simplification for this test harness — the
-goal is straightforward continuous read-out, not the power-cycled,
-battery-optimised behaviour `luftfugl-motor` will eventually need.
+VDD is wired permanently — there is no MOSFET or load switch on this board.
+Low-power state is controlled entirely at the protocol level, via the
+sensor's own `power_down`/`wake_up` commands, driven from the console (see
+`spec.md`). This is a different mechanism from physically cutting power —
+the sensor stays powered throughout, just in a low-current internal state.
 
 ---
 

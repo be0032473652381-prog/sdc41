@@ -7,8 +7,8 @@ Debug/development firmware — no production restrictions.
 
 ## Scope
 
-Standalone SCD41 parameter read-out harness on a dedicated RP2040 board,
-separate from `luftfugl-motor` at build time.
+Standalone SCD41 parameter read-out and power-state control harness on a
+dedicated RP2040 board.
 
 ## Hardware facts
 

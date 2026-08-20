@@ -326,13 +326,84 @@ immediately and print real values even on the very first boot call.
 
 ---
 
+## Power control — `sdc41 on` / `sdc41 off`
+
+VDD is permanently wired on this board (`hardware.md`) — there is no
+physical switch. This is protocol-level power control, using the sensor's
+own `power_down`/`wake_up` commands.
+
+**Typed commands, Enter to submit — not raw keystrokes.** Deliberately not
+single letters like `o`/`f`: a stray `o` or `f` as the first character of
+any future command name (`offset`, or anything else starting with those
+letters) would otherwise fire the wrong action before the rest of the word
+is even typed. This project's whole console already works on typed-word-
+then-Enter; this feature follows the same rule rather than introducing a
+different, riskier input mechanism.
+
+| Command | Effect |
+|---|---|
+| `sdc41 off` | `enter_idle()`, then `power_down` (0x36e0). Rejected with `rejected: sdc41 already off` if already off. |
+| `sdc41 on` | `wake_up` (0x36f6), then a 60-second warm-up, then `start_periodic_measurement`. Rejected with `rejected: sdc41 already on` if not currently off. |
+
+**`wake_up` is never ACKed by the sensor — this is documented, not a bug.**
+Do not treat the missing ACK as `SDC41_ERR_WRITE` for this one call; a
+normal I²C write failure check would otherwise report every successful wake
+as an error.
+
+### Status line — one line, always present, right below the header
+
+Immediately after the title/serial/i2c-address block, one status line shows
+the current power state. It replaces the entire variable parameter block
+(co2, filter, temperature, humidity, asc, offset, altitude, mode, data
+ready) whenever the sensor isn't fully active — those rows have nothing
+meaningful to show while off or warming up, so they're not drawn rather
+than shown stale or blank field-by-field:
+
+```
+luftfugl sdc41 — SCD41 test harness
+- serial      = 74947532110605
+- i2c address = 0x62
+
+SDC41 = OFF
+```
+
+or, mid-warm-up, counting down every second:
+
+```
+SDC41 is Warming up (37 sec ... counting down to 0)
+```
+
+Once the 60-second warm-up completes, the status line changes once to:
+
+```
+SDC41 active
+```
+
+and the normal parameter block resumes below it exactly as before —
+`co2`/`filter` starting fresh (buffer empty, `filter = 100%`), since
+whatever sampling state existed before `sdc41 off` is no longer valid after
+a real power cycle.
+
+### State reset on `sdc41 off`
+
+Powering off invalidates in-progress sampling — clear the CO₂ ring buffer,
+reset `filter` to 0/empty, and the EMA does **not** need preserving across
+an intentional power-down (unlike the batch-to-batch persistence during
+normal operation) since the sensor itself has gone through a real state
+change.
+
+---
+
 ## Boot sequence
 
 ```
 power on
 wait 1000 ms (SCD41 power-up requirement), printing progress every 100 ms
 start periodic measurement
-print the menu display, once (see "The menu display" above)
+begin the 60-second warm-up window (same mechanism as "sdc41 on" — see
+  "Power control" above), sample suppression active
+after 60 s: normal operation begins, filter/batch tracking starts fresh
+print the menu display, once
 enter console loop
 ```
 
@@ -357,6 +428,41 @@ then periodic measurement starts.
 No console command may be issued before the 1000 ms power-up window has
 passed — if one arrives early, queue it or reject it with a clear message
 rather than sending it to a sensor that is not yet ready.
+
+### The 60-second warm-up applies here too, same as `sdc41 on`
+
+The 1000 ms wait above is the datasheet's **command-readiness** window —
+when the chip will accept I²C commands. It is not the same thing as
+**thermal stabilization**, which is what the 60-second warm-up (already
+specified under "Power control") addresses. A cold power-on needs the same
+thermal settling a wake-from-`power_down` does — arguably more, since it's
+starting from zero rather than a documented low-power state.
+
+`start_periodic_measurement` is still issued immediately after the 1000 ms
+wait, unchanged — the chip can accept and begin its own internal sampling
+cycle regardless of thermal state; issuing the command doesn't need to wait.
+What *does* wait is display and filtering:
+
+- The status line shows `SDC41 is Warming up (N sec ... counting down to
+  0)` for the full 60 seconds, exactly as specified for `sdc41 on` — same
+  text, same countdown mechanism, one shared implementation for both
+  triggers, not two.
+- The full parameter block is not drawn during this window, same as the
+  `sdc41 on` case.
+- **`poll_periodic_sample()` still runs** (so `data_ready`/measurement
+  reads keep working internally), but any reading accepted during the 60 s
+  window is **not** pushed into the CO₂ filter's ring buffer. A reading
+  taken while the sensor is still thermally settling is expected to carry a
+  systematic drift, not just random noise — a median filter rejects
+  outliers, not a consistent bias, so including warm-up-period samples
+  would quietly undermine the filter rather than help it.
+- Once the 60 s elapses: status line changes to `SDC41 active`, full
+  parameter block resumes, and `filter`/batch tracking begins genuinely
+  fresh — 0%, empty buffer — exactly as if this were the very first sample
+  the firmware had ever seen. This is the same end state whether the 60 s
+  came from a cold boot or from `sdc41 on`; the two triggers share one
+  invariant: **no filter/batch state exists before 60 real seconds of
+  warm-up have elapsed, however that warm-up was triggered.**
 
 ---
 
