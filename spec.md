@@ -167,6 +167,41 @@ connected — before the countdown restarts on the next sample.
 4. Update `co2` to the new `ema` value. Reset the buffer to empty. The next
    raw sample starts the next batch immediately; `filter` returns to 100%.
 
+### Countdown timers — real elapsed time, not a fabricated guess
+
+Two countdowns, appended to the end of the `co2` and `co2 raw` rows on the
+same line:
+
+```
+- co2         = 1355 ppm - 12 seconds
+- co2 raw     = 1240 ppm - 3 seconds
+```
+
+This is a deliberate, narrow exception to "only update on a genuine event"
+— it's justified because the SCD41's periodic interval is a **fixed 5 s
+hardware constant**, the same kind of known, deterministic wait the boot
+sequence already counts down (1000 ms in 100 ms steps). Counting down to a
+known constant is showing something true; it's not the same as interpolating
+a guess about uncertain timing.
+
+Both derive from **one shared clock** — seconds elapsed since the last raw
+sample was accepted — so they can't drift apart from each other or from
+what's actually happening:
+
+- **`co2 raw` countdown**: `5 − elapsed_seconds_since_last_raw_sample`,
+  ticking down every second, resetting to 5 the instant a new raw sample is
+  accepted.
+- **`co2` (filtered) countdown**: `(7 − samples_in_current_batch) × 5 −
+  elapsed_seconds_since_last_raw_sample` — the number of raw samples still
+  needed to complete the current batch, times the 5 s interval, minus
+  however far into the current wait we already are. Resets naturally to 35
+  the moment a batch completes and the next one starts, since
+  `samples_in_current_batch` drops to 0 at that instant.
+
+Both clamp at 0, never go negative, and re-derive from the shared elapsed
+timer every second rather than being two independent counters that could
+fall out of sync with each other.
+
 ### What the operator sees
 
 `co2` shows the filtered (EMA-across-batches) value, updating roughly every
