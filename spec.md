@@ -82,9 +82,33 @@ must be typeable exactly as shown.
 | `menu` | `menu` | Print every readable parameter, one per line, key = value |
 | `help` | `help` | List every command with an example |
 | `help <cmd>` | `help offset` | Detail for one command |
+| `sdc41 on` / `sdc41 off` | `sdc41 off` | Wake/power-down the sensor, see "Power control" below |
 
 Rejections must say what was wrong, in plain words — `rejected: offset must
 be between -20 and 40 degrees`, not a bare error code.
+
+**This table itself has drifted out of date more than once** — `sdc41
+on`/`off` was missing until just now. When implementing the on-screen
+command list below, enumerate the actual dispatch table in the running
+source, not this table or any other written list — the code is the only
+thing guaranteed current.
+
+### Prompt text and the always-visible command reference
+
+The prompt reads `Enter Command > `, not the current `>`.
+
+**Immediately below the prompt row, CRLF, then a static block listing
+every command currently in the dispatch table, each with a working
+example** — always visible, not something requiring `help` to see. Drawn
+once at startup as part of the static frame (same category as the title —
+never refreshed, never touched by the 5-second auto-refresh), enumerated
+from the real dispatch table in code, not copied from this document.
+
+This changes where scrolling command output goes: it can no longer share
+space with the now-static command list, so it moves to below the new
+block. Report the total row count this adds and whether it still fits a
+standard 80×24 terminal — if not, say so rather than silently truncating
+anything.
 
 ---
 
