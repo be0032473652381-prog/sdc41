@@ -2,17 +2,28 @@
 # run.sh — build, load, and reset the sdc41 firmware over SWD.
 #
 # This board's flash write path does not work (diagnosed: every erase/program
-# operation times out; reads and RAM loading are fine). So "flashing" here
-# means loading straight into SRAM and jumping the CPU there — it does not
-# persist across power loss, and must be reloaded after every reset.
+# operation times out; reads and RAM loading are fine). There is no true
+# "flash" on this board — nothing persists, and a bare SWD reset without
+# reloading will leave the target running nothing at all (this happened
+# once already: a plain "reset run" outside this script wiped the firmware,
+# because it sent the CPU back to a boot ROM with no valid flash image to
+# find). Every command below that touches hardware always does the FULL
+# build+load+resume sequence — there is deliberately no standalone "just
+# reset" option, to prevent repeating that mistake.
+#
+# "flash" and "reboot" below are aliases for the same thing as "all" —
+# they exist so you can use the vocabulary that matches a normal board,
+# even though what actually happens is a RAM load, not a flash write.
 #
 # Usage:
 #   ./run.sh            build + load + reset   (default)
-#   ./run.sh build       build only
-#   ./run.sh load        load the existing build, no rebuild
-#   ./run.sh console     just open picocom
-#   ./run.sh status      show git state and whether the build is stale
-#   ./run.sh kill        kill any stuck openocd/picocom holding the port
+#   ./run.sh flash       same as above — alias, for normal-board vocabulary
+#   ./run.sh reboot       same as above — alias
+#   ./run.sh build        build only, no hardware touched
+#   ./run.sh load         load the existing build, no rebuild
+#   ./run.sh console      just open picocom
+#   ./run.sh status       show git state and whether the build is stale
+#   ./run.sh kill          kill any stuck openocd/picocom holding the port
 
 set -uo pipefail
 cd "$(dirname "$0")"
@@ -97,6 +108,8 @@ do_load() {
     check_probe || return 1
 
     echo "== loading via SWD, resetting target — $(git_state) =="
+    echo "   (this is the RAM-load 'flash' equivalent for this board — see"
+    echo "    the note at the top of this script for why)"
     if ! openocd -f interface/cmsis-dap.cfg -f target/rp2040.cfg \
         -c "adapter speed ${ADAPTER_SPEED}" \
         -c "init" \
@@ -120,6 +133,15 @@ do_console() {
     picocom -b "${BAUD}" --omap crlf "${PORT}"
 }
 
+do_all() {
+    do_build || exit 1
+    echo
+    echo ">>> If you don't already have './run.sh console' open in another"
+    echo ">>> terminal, open it now to catch the boot output. Loading in 3s."
+    sleep 3
+    do_load
+}
+
 # ---- entry ------------------------------------------------------------
 
 case "${1:-all}" in
@@ -128,16 +150,9 @@ case "${1:-all}" in
     console) do_console ;;
     status)  do_status ;;
     kill)    kill_stale ;;
-    all)
-        do_build || exit 1
-        echo
-        echo ">>> If you don't already have './run.sh console' open in another"
-        echo ">>> terminal, open it now to catch the boot output. Loading in 3s."
-        sleep 3
-        do_load
-        ;;
+    all|flash|reboot) do_all ;;
     *)
-        echo "usage: $0 [build|load|console|status|kill|all]"
+        echo "usage: $0 [build|load|console|status|kill|flash|reboot|all]"
         exit 1
         ;;
 esac
