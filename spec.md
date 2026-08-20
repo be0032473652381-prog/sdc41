@@ -350,39 +350,50 @@ Do not treat the missing ACK as `SDC41_ERR_WRITE` for this one call; a
 normal I²C write failure check would otherwise report every successful wake
 as an error.
 
-### Status line — one line, always present, right below the header
+### Status line and field placeholders — layout never changes shape
 
 Immediately after the title/serial/i2c-address block, one status line shows
-the current power state. It replaces the entire variable parameter block
-(co2, filter, temperature, humidity, asc, offset, altitude, mode, data
-ready) whenever the sensor isn't fully active — those rows have nothing
-meaningful to show while off or warming up, so they're not drawn rather
-than shown stale or blank field-by-field:
+the current power state. **All ten field rows are always drawn, in the
+same fixed positions, whether the sensor is off, warming up, or active** —
+the layout's shape never changes; only the *values* in those rows do. This
+is simpler than the earlier design (which hid the whole block) and avoids
+the screen visibly jumping or reflowing the moment warm-up completes.
+
+While off or warming up, every field's value is the literal placeholder
+text `thermal stabilisation waiting` — not blank, not stale, not omitted:
 
 ```
 luftfugl sdc41 — SCD41 test harness
 - serial      = 74947532110605
 - i2c address = 0x62
 
-SDC41 = OFF
+SDC41 is Warming up (53 sec ... counting down to 0)
+- co2         = thermal stabilisation waiting
+- co2 raw     = thermal stabilisation waiting
+- filter      = thermal stabilisation waiting
+- temperature = thermal stabilisation waiting
+- humidity    = thermal stabilisation waiting
+- asc         = thermal stabilisation waiting
+- offset      = thermal stabilisation waiting
+- altitude    = thermal stabilisation waiting
+- mode        = thermal stabilisation waiting
+- data ready  = thermal stabilisation waiting
 ```
 
-or, mid-warm-up, counting down every second:
+When off (via `sdc41 off`), same layout, status line reads `SDC41 = OFF`
+instead, same placeholder in every field.
 
-```
-SDC41 is Warming up (37 sec ... counting down to 0)
-```
+**Once the 60-second warm-up completes, the status line changes to `SDC41
+active`, and every field's placeholder is replaced with its real value** —
+same ten row positions, nothing moves. `co2`/`filter` start genuinely
+fresh at that moment (buffer empty, `filter = 100%`), since whatever
+sampling state existed before is no longer valid after a real power cycle
+or a cold boot.
 
-Once the 60-second warm-up completes, the status line changes once to:
-
-```
-SDC41 active
-```
-
-and the normal parameter block resumes below it exactly as before —
-`co2`/`filter` starting fresh (buffer empty, `filter = 100%`), since
-whatever sampling state existed before `sdc41 off` is no longer valid after
-a real power cycle.
+**Verify `SDC41 active` genuinely appears on hardware** — this transition
+is already specified and the code path for it exists, but confirm it's
+actually visible at the moment the countdown reaches 0, not silently
+skipped.
 
 ### State reset on `sdc41 off`
 
@@ -393,6 +404,7 @@ normal operation) since the sensor itself has gone through a real state
 change.
 
 ---
+
 
 ## Boot sequence
 
@@ -447,8 +459,9 @@ What *does* wait is display and filtering:
   0)` for the full 60 seconds, exactly as specified for `sdc41 on` — same
   text, same countdown mechanism, one shared implementation for both
   triggers, not two.
-- The full parameter block is not drawn during this window, same as the
-  `sdc41 on` case.
+- Every field row is drawn showing the placeholder `thermal stabilisation
+  waiting` as its value, same as the `sdc41 on` case — layout shape never
+  changes, only which values are shown.
 - **`poll_periodic_sample()` still runs** (so `data_ready`/measurement
   reads keep working internally), but any reading accepted during the 60 s
   window is **not** pushed into the CO₂ filter's ring buffer. A reading
