@@ -2,19 +2,13 @@
 
 #include "hardware/gpio.h"
 #include "hardware/i2c.h"
-#include "hardware/uart.h"
 #include "pico/stdlib.h"
 
 #include "sdc41_crc.h"
 
-#define SDC41_ADDRESS 0x62u
 #define SDC41_I2C i2c0
 #define SDC41_SDA_PIN 4u
 #define SDC41_SCL_PIN 5u
-
-static void console_write(const char *text) {
-    uart_puts(uart1, text);
-}
 
 enum {
     CMD_START_PERIODIC = 0x21b1,
@@ -34,9 +28,17 @@ enum {
 
 static sdc41_result_t write_command(uint16_t command) {
     const uint8_t bytes[2] = {(uint8_t)(command >> 8), (uint8_t)command};
-    return i2c_write_blocking(SDC41_I2C, SDC41_ADDRESS, bytes, 2, false) == 2
-               ? SDC41_OK
-               : SDC41_ERR_WRITE;
+    absolute_time_t deadline = make_timeout_time_ms(1000);
+    for (;;) {
+        int written = i2c_write_blocking_until(
+            SDC41_I2C, SDC41_ADDRESS, bytes, 2, false,
+            make_timeout_time_ms(50));
+        if (written == 2) return SDC41_OK;
+        if (absolute_time_diff_us(get_absolute_time(), deadline) <= 0) {
+            return SDC41_ERR_WRITE;
+        }
+        sleep_ms(20);
+    }
 }
 
 static sdc41_result_t write_command_word(uint16_t command, uint16_t word) {
@@ -50,24 +52,19 @@ static sdc41_result_t write_command_word(uint16_t command, uint16_t word) {
 
 static sdc41_result_t read_words(uint16_t command, uint16_t *words,
                                  size_t word_count, uint32_t delay_ms) {
-    console_write("rw: before write\r\n");
     sdc41_result_t result = write_command(command);
-    console_write("rw: after write\r\n");
     if (result != SDC41_OK) {
         return result;
     }
     sleep_ms(delay_ms);
-    console_write("rw: after delay\r\n");
 
     uint8_t bytes[9];
     const size_t byte_count = word_count * 3u;
-    console_write("rw: before read\r\n");
     if (byte_count > sizeof(bytes) ||
         i2c_read_blocking(SDC41_I2C, SDC41_ADDRESS, bytes, byte_count, false) !=
             (int)byte_count) {
         return SDC41_ERR_READ;
     }
-    console_write("rw: after read\r\n");
     for (size_t i = 0; i < word_count; ++i) {
         const size_t offset = i * 3u;
         if (sdc41_crc8(&bytes[offset], 2) != bytes[offset + 2]) {

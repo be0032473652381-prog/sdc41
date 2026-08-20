@@ -17,12 +17,33 @@
 #define CONSOLE_TX_PIN 8u
 #define CONSOLE_RX_PIN 9u
 #define LINE_CAPACITY 96u
+#define AUTO_REFRESH_INTERVAL_MS 5000u
+#define SAMPLE_POLL_INTERVAL_MS 1000u
+#define CO2_FILTER_SAMPLE_COUNT 7u
+#define DISPLAY_VALUE_COLUMN 17u
+#define DISPLAY_PROMPT_ROW 16u
+#define DISPLAY_OUTPUT_FIRST_ROW 17u
+#define DISPLAY_OUTPUT_LAST_ROW 24u
 
 typedef enum { MODE_PERIODIC, MODE_SINGLE } measurement_mode_t;
 
 static measurement_mode_t mode = MODE_PERIODIC;
 static sdc41_measurement_t last_measurement;
 static bool have_measurement;
+static sdc41_result_t last_measurement_result = SDC41_OK;
+static bool last_data_ready;
+static sdc41_result_t last_ready_result = SDC41_OK;
+
+typedef struct {
+    uint16_t samples[CO2_FILTER_SAMPLE_COUNT];
+    uint8_t count;
+    uint8_t next;
+    bool batch_just_completed;
+    bool ema_seeded;
+    int32_t ema_milli_ppm;
+} co2_filter_t;
+
+static co2_filter_t co2_filter;
 
 typedef struct {
     uint16_t serial_words[3];
@@ -45,13 +66,25 @@ typedef struct {
     measurement_mode_t mode;
     sdc41_result_t ready_result;
     bool ready;
+    uint8_t filter_count;
+    bool filtered_co2_available;
+    int32_t filtered_co2_milli_ppm;
 } menu_snapshot_t;
 
 static menu_snapshot_t last_printed_menu;
 static bool have_last_printed_menu;
+static bool command_output_active;
+static unsigned command_output_row = DISPLAY_OUTPUT_FIRST_ROW;
 
 static void console_write(const char *text) {
     uart_puts(CONSOLE_UART, text);
+    if (command_output_active) {
+        for (const char *cursor = text; *cursor != '\0'; ++cursor) {
+            if (*cursor == '\n' && command_output_row < DISPLAY_OUTPUT_LAST_ROW) {
+                ++command_output_row;
+            }
+        }
+    }
 }
 
 static void console_printf(const char *format, ...) {
@@ -61,6 +94,57 @@ static void console_printf(const char *format, ...) {
     (void)vsnprintf(buffer, sizeof(buffer), format, args);
     va_end(args);
     console_write(buffer);
+}
+
+static void format_fixed_milli(char *buffer, size_t size, int32_t value,
+                               const char *unit) {
+    const char *sign = value < 0 ? "-" : "";
+    uint32_t magnitude =
+        value < 0 ? (uint32_t)(-(int64_t)value) : (uint32_t)value;
+    (void)snprintf(buffer, size, "%s%lu.%03lu%s", sign,
+                   (unsigned long)(magnitude / 1000u),
+                   (unsigned long)(magnitude % 1000u), unit);
+}
+
+static void draw_fixed_layout(void) {
+    console_write("\x1b[2J\x1b[17;r\x1b[H"
+                  "luftfugl sdc41 — SCD41 test harness\r\n"
+                  "\r\n"
+                  "  co2         = \r\n"
+                  "  co2 raw     = \r\n"
+                  "  filter      = \r\n"
+                  "  temperature = \r\n"
+                  "  humidity    = \r\n"
+                  "  serial      = \r\n"
+                  "  asc         = \r\n"
+                  "  offset      = \r\n"
+                  "  altitude    = \r\n"
+                  "  mode        = \r\n"
+                  "  data ready  = \r\n"
+                  "  i2c address = \r\n"
+                  "\r\n"
+                  "> ");
+    command_output_active = false;
+    command_output_row = DISPLAY_OUTPUT_FIRST_ROW;
+}
+
+static void update_fixed_field(unsigned row, const char *value) {
+    console_printf("\x1b[s\x1b[%u;%uH\x1b[K%s\x1b[u", row,
+                   DISPLAY_VALUE_COLUMN, value);
+}
+
+static void show_command_prompt(void) {
+    console_printf("\x1b[%u;1H\x1b[K> ", DISPLAY_PROMPT_ROW);
+}
+
+static void begin_command_output(void) {
+    console_printf("\x1b[%u;1H\x1b[K", command_output_row);
+    command_output_active = true;
+}
+
+static void end_command_output(void) {
+    command_output_active = false;
+    show_command_prompt();
 }
 
 static void print_sensor_error(const char *operation, sdc41_result_t result) {
@@ -74,8 +158,78 @@ static void print_fixed_milli(int32_t value, const char *unit) {
                    (unsigned long)(magnitude % 1000u), unit);
 }
 
+static uint16_t median_of_filter_samples(void) {
+    uint16_t sorted[CO2_FILTER_SAMPLE_COUNT];
+    memcpy(sorted, co2_filter.samples, sizeof(sorted));
+    for (size_t i = 1; i < CO2_FILTER_SAMPLE_COUNT; ++i) {
+        uint16_t value = sorted[i];
+        size_t position = i;
+        while (position > 0 && sorted[position - 1] > value) {
+            sorted[position] = sorted[position - 1];
+            --position;
+        }
+        sorted[position] = value;
+    }
+    return sorted[CO2_FILTER_SAMPLE_COUNT / 2u];
+}
+
+static void filter_push(uint16_t raw_co2_ppm) {
+    co2_filter.batch_just_completed = false;
+    co2_filter.samples[co2_filter.next] = raw_co2_ppm;
+    co2_filter.next =
+        (uint8_t)((co2_filter.next + 1u) % CO2_FILTER_SAMPLE_COUNT);
+    ++co2_filter.count;
+    if (co2_filter.count == CO2_FILTER_SAMPLE_COUNT) {
+        int32_t median_milli_ppm = (int32_t)median_of_filter_samples() * 1000;
+        if (!co2_filter.ema_seeded) {
+            co2_filter.ema_milli_ppm = median_milli_ppm;
+            co2_filter.ema_seeded = true;
+        } else {
+            co2_filter.ema_milli_ppm =
+                (3 * median_milli_ppm + 7 * co2_filter.ema_milli_ppm + 5) /
+                10;
+        }
+        co2_filter.count = 0;
+        co2_filter.next = 0;
+        co2_filter.batch_just_completed = true;
+    }
+}
+
+static uint8_t filter_display_count(void) {
+    return co2_filter.batch_just_completed ? CO2_FILTER_SAMPLE_COUNT
+                                           : co2_filter.count;
+}
+
+static uint16_t filtered_co2_ppm(void) {
+    return (uint16_t)((co2_filter.ema_milli_ppm + 500) / 1000);
+}
+
+static void accept_measurement(const sdc41_measurement_t *measurement) {
+    last_measurement = *measurement;
+    have_measurement = true;
+    last_measurement_result = SDC41_OK;
+    filter_push(measurement->co2_ppm);
+}
+
+static void poll_periodic_sample(void) {
+    bool ready = false;
+    last_ready_result = sdc41_get_ready(&ready);
+    if (last_ready_result != SDC41_OK) return;
+    last_data_ready = ready;
+    if (!ready) return;
+
+    sdc41_measurement_t measurement;
+    last_measurement_result = sdc41_read_measurement(&measurement);
+    if (last_measurement_result == SDC41_OK) accept_measurement(&measurement);
+}
+
 static void print_measurement(const sdc41_measurement_t *measurement) {
-    console_printf("co2: %u ppm, temperature: ", measurement->co2_ppm);
+    if (!co2_filter.ema_seeded)
+        console_printf("co2: pending, co2 raw: %u ppm, temperature: ",
+                       measurement->co2_ppm);
+    else
+        console_printf("co2: %u ppm, co2 raw: %u ppm, temperature: ",
+                       filtered_co2_ppm(), measurement->co2_ppm);
     print_fixed_milli(measurement->temperature_milli_c, " degrees C");
     console_write(", humidity: ");
     print_fixed_milli((int32_t)measurement->humidity_milli_percent, " %RH\r\n");
@@ -134,23 +288,19 @@ static void command_co2(const char *args) {
         console_write("rejected: co2 takes no arguments; example: co2\r\n");
         return;
     }
-    sdc41_result_t result;
+    sdc41_result_t result = last_measurement_result;
     if (mode == MODE_SINGLE) {
         console_write("single-shot measurement: waiting 5000 ms\r\n");
         result = sdc41_measure_single_shot();
-        if (result == SDC41_OK) result = sdc41_read_measurement(&last_measurement);
-        if (result == SDC41_OK) have_measurement = true;
-    } else {
-        bool ready = false;
-        result = sdc41_get_ready(&ready);
-        if (result == SDC41_OK && ready) {
-            result = sdc41_read_measurement(&last_measurement);
-            if (result == SDC41_OK) have_measurement = true;
+        if (result == SDC41_OK) {
+            sdc41_measurement_t measurement;
+            result = sdc41_read_measurement(&measurement);
+            if (result == SDC41_OK) accept_measurement(&measurement);
         }
-        if (result == SDC41_OK && !have_measurement) {
-            console_write("co2: no periodic measurement available yet; try again after 5 seconds\r\n");
-            return;
-        }
+    }
+    if (result == SDC41_OK && !have_measurement) {
+        console_write("co2: no measurement available yet; try again after 5 seconds\r\n");
+        return;
     }
     if (result != SDC41_OK) print_sensor_error("could not read measurement", result);
     else print_measurement(&last_measurement);
@@ -161,10 +311,10 @@ static void command_ready(const char *args) {
         console_write("rejected: ready takes no arguments; example: ready\r\n");
         return;
     }
-    bool ready;
-    sdc41_result_t result = sdc41_get_ready(&ready);
-    if (result != SDC41_OK) print_sensor_error("could not read data-ready status", result);
-    else console_printf("data ready: %s\r\n", ready ? "yes" : "no");
+    if (last_ready_result != SDC41_OK)
+        print_sensor_error("could not read data-ready status", last_ready_result);
+    else
+        console_printf("data ready: %s\r\n", last_data_ready ? "yes" : "no");
 }
 
 static void command_serial(const char *args) {
@@ -293,8 +443,8 @@ static void command_status(const char *args) {
         console_write("rejected: status takes no arguments; example: status\r\n");
         return;
     }
-    bool ready;
-    sdc41_result_t ready_result = sdc41_get_ready(&ready);
+    bool ready = last_data_ready;
+    sdc41_result_t ready_result = last_ready_result;
     bool restart;
     if (!begin_idle_operation("could not stop periodic measurement", &restart)) return;
     bool asc;
@@ -313,8 +463,9 @@ static void command_status(const char *args) {
     else console_printf(", data ready=error (%s)\r\n", sdc41_result_string(ready_result));
 }
 
-static void print_menu_value_error(sdc41_result_t result) {
-    console_printf("error (%s)\r\n", sdc41_result_string(result));
+static void format_menu_error(char *buffer, size_t size,
+                              sdc41_result_t result) {
+    (void)snprintf(buffer, size, "error (%s)", sdc41_result_string(result));
 }
 
 static void refresh_menu_config(void) {
@@ -355,15 +506,9 @@ static bool result_value_changed(sdc41_result_t current_result,
 }
 
 static void print_menu(bool refresh_config, bool changed_only) {
-    bool ready = false;
-    console_write("checkpoint B\r\n");
-    sdc41_result_t ready_result = sdc41_get_ready(&ready);
-    console_write("checkpoint C\r\n");
-    sdc41_result_t measurement_result = SDC41_OK;
-    if (ready_result == SDC41_OK && ready) {
-        measurement_result = sdc41_read_measurement(&last_measurement);
-        if (measurement_result == SDC41_OK) have_measurement = true;
-    }
+    bool ready = last_data_ready;
+    sdc41_result_t ready_result = last_ready_result;
+    sdc41_result_t measurement_result = last_measurement_result;
 
     if (refresh_config) refresh_menu_config();
 
@@ -375,12 +520,24 @@ static void print_menu(bool refresh_config, bool changed_only) {
         .mode = mode,
         .ready_result = ready_result,
         .ready = ready,
+        .filter_count = filter_display_count(),
+        .filtered_co2_available = co2_filter.ema_seeded,
+        .filtered_co2_milli_ppm = co2_filter.ema_milli_ppm,
     };
     bool all = !changed_only || !have_last_printed_menu;
+    bool filter_ready = current.filter_count == CO2_FILTER_SAMPLE_COUNT;
     bool co2_changed =
+        all || current.filtered_co2_available !=
+                   last_printed_menu.filtered_co2_available ||
+        (current.filtered_co2_available &&
+         current.filtered_co2_milli_ppm !=
+             last_printed_menu.filtered_co2_milli_ppm);
+    bool raw_co2_changed =
         all || measurement_field_changed(&current, &last_printed_menu,
                                          current.measurement.co2_ppm,
                                          last_printed_menu.measurement.co2_ppm);
+    bool filter_changed =
+        all || co2_filter.count != last_printed_menu.filter_count;
     bool temperature_changed =
         all || measurement_field_changed(
                    &current, &last_printed_menu,
@@ -392,33 +549,56 @@ static void print_menu(bool refresh_config, bool changed_only) {
                    (int32_t)current.measurement.humidity_milli_percent,
                    (int32_t)last_printed_menu.measurement.humidity_milli_percent);
 
+    if (all) draw_fixed_layout();
+
+    char value[80];
+
     if (co2_changed) {
-        console_write("co2 = ");
-        if (measurement_result != SDC41_OK)
-            print_menu_value_error(measurement_result);
-        else if (!have_measurement)
-            console_write("pending\r\n");
+        if (!current.filtered_co2_available)
+            (void)snprintf(value, sizeof(value), "pending");
         else
-            console_printf("%u ppm\r\n", last_measurement.co2_ppm);
+            (void)snprintf(value, sizeof(value), "%u ppm",
+                           filtered_co2_ppm());
+        update_fixed_field(3, value);
+    }
+    if (raw_co2_changed) {
+        if (measurement_result != SDC41_OK)
+            format_menu_error(value, sizeof(value), measurement_result);
+        else if (!have_measurement)
+            (void)snprintf(value, sizeof(value), "pending");
+        else
+            (void)snprintf(value, sizeof(value), "%u ppm",
+                           last_measurement.co2_ppm);
+        update_fixed_field(4, value);
+    }
+    if (filter_changed) {
+        static const char *const progress[CO2_FILTER_SAMPLE_COUNT] = {
+            "100%", "86%", "71%", "57%", "43%", "29%", "14%",
+        };
+        (void)snprintf(value, sizeof(value), "%s",
+                       filter_ready ? "ready" : progress[current.filter_count]);
+        update_fixed_field(5, value);
     }
     if (temperature_changed) {
-        console_write("temperature = ");
         if (measurement_result != SDC41_OK)
-            print_menu_value_error(measurement_result);
+            format_menu_error(value, sizeof(value), measurement_result);
         else if (!have_measurement)
-            console_write("pending\r\n");
+            (void)snprintf(value, sizeof(value), "pending");
         else
-            print_fixed_milli(last_measurement.temperature_milli_c, " C\r\n");
+            format_fixed_milli(value, sizeof(value),
+                               last_measurement.temperature_milli_c, " C");
+        update_fixed_field(6, value);
     }
     if (humidity_changed) {
-        console_write("humidity = ");
         if (measurement_result != SDC41_OK)
-            print_menu_value_error(measurement_result);
+            format_menu_error(value, sizeof(value), measurement_result);
         else if (!have_measurement)
-            console_write("pending\r\n");
+            (void)snprintf(value, sizeof(value), "pending");
         else
-            print_fixed_milli((int32_t)last_measurement.humidity_milli_percent,
-                              " %RH\r\n");
+            format_fixed_milli(
+                value, sizeof(value),
+                (int32_t)last_measurement.humidity_milli_percent, " %RH");
+        update_fixed_field(7, value);
     }
 
     uint64_t serial = ((uint64_t)menu_config.serial_words[0] << 32) |
@@ -431,56 +611,63 @@ static void print_menu(bool refresh_config, bool changed_only) {
     if (all || result_value_changed(menu_config.serial_result,
                                     last_printed_menu.config.serial_result,
                                     serial, previous_serial)) {
-        console_write("serial = ");
         if (menu_config.serial_result == SDC41_OK)
-            console_printf("%llu\r\n", (unsigned long long)serial);
+            (void)snprintf(value, sizeof(value), "%llu",
+                           (unsigned long long)serial);
         else
-            print_menu_value_error(menu_config.serial_result);
+            format_menu_error(value, sizeof(value), menu_config.serial_result);
+        update_fixed_field(8, value);
     }
     if (all || result_value_changed(menu_config.asc_result,
                                     last_printed_menu.config.asc_result,
                                     menu_config.asc,
                                     last_printed_menu.config.asc)) {
-        console_write("asc = ");
         if (menu_config.asc_result == SDC41_OK)
-            console_printf("%s\r\n", menu_config.asc ? "on" : "off");
+            (void)snprintf(value, sizeof(value), "%s",
+                           menu_config.asc ? "on" : "off");
         else
-            print_menu_value_error(menu_config.asc_result);
+            format_menu_error(value, sizeof(value), menu_config.asc_result);
+        update_fixed_field(9, value);
     }
     if (all || result_value_changed(menu_config.offset_result,
                                     last_printed_menu.config.offset_result,
                                     menu_config.offset_raw,
                                     last_printed_menu.config.offset_raw)) {
-        console_write("offset = ");
         if (menu_config.offset_result == SDC41_OK) {
             int32_t offset_milli = (int32_t)(
                 ((uint64_t)menu_config.offset_raw * 175000u) / 65536u);
-            print_fixed_milli(offset_milli, " C\r\n");
+            format_fixed_milli(value, sizeof(value), offset_milli, " C");
         } else {
-            print_menu_value_error(menu_config.offset_result);
+            format_menu_error(value, sizeof(value), menu_config.offset_result);
         }
+        update_fixed_field(10, value);
     }
     if (all || result_value_changed(menu_config.altitude_result,
                                     last_printed_menu.config.altitude_result,
                                     menu_config.altitude,
                                     last_printed_menu.config.altitude)) {
-        console_write("altitude = ");
         if (menu_config.altitude_result == SDC41_OK)
-            console_printf("%u m\r\n", menu_config.altitude);
+            (void)snprintf(value, sizeof(value), "%u m",
+                           menu_config.altitude);
         else
-            print_menu_value_error(menu_config.altitude_result);
+            format_menu_error(value, sizeof(value), menu_config.altitude_result);
+        update_fixed_field(11, value);
     }
-    if (all || mode != last_printed_menu.mode)
-        console_printf("mode = %s\r\n",
+    if (all || mode != last_printed_menu.mode) {
+        (void)snprintf(value, sizeof(value), "%s",
                        mode == MODE_PERIODIC ? "periodic" : "single");
-    if (all || result_value_changed(ready_result,
-                                    last_printed_menu.ready_result, ready,
-                                    last_printed_menu.ready)) {
-        console_write("data ready = ");
+        update_fixed_field(12, value);
+    }
+    if (all) {
         if (ready_result == SDC41_OK)
-            console_printf("%s\r\n", ready ? "yes" : "no");
+            (void)snprintf(value, sizeof(value), "%s", ready ? "yes" : "no");
         else
-            print_menu_value_error(ready_result);
+            format_menu_error(value, sizeof(value), ready_result);
+        update_fixed_field(13, value);
+    }
+    if (all) {
+        (void)snprintf(value, sizeof(value), "0x%02X", SDC41_ADDRESS);
+        update_fixed_field(14, value);
     }
 
     last_printed_menu = current;
@@ -593,29 +780,34 @@ int main(void) {
     sdc41_result_t result = sdc41_start_periodic();
     if (result == SDC41_OK) {
         console_write("mode: periodic measurement started\r\n");
-        console_write("checkpoint A\r\n");
     }
     else print_sensor_error("could not start periodic measurement", result);
     print_menu(true, false);
-    console_write("console ready; type help\r\n");
 
     char line[LINE_CAPACITY];
     size_t length = 0;
     bool ignored_lf = false;
-    absolute_time_t refresh_deadline = make_timeout_time_ms(3000);
+    absolute_time_t refresh_deadline =
+        make_timeout_time_ms(AUTO_REFRESH_INTERVAL_MS);
+    absolute_time_t sample_deadline =
+        make_timeout_time_ms(SAMPLE_POLL_INTERVAL_MS);
     while (true) {
+        bool did_work = false;
         if (uart_is_readable(CONSOLE_UART)) {
+            did_work = true;
             char ch = (char)uart_getc(CONSOLE_UART);
             if (ch == '\r' || ch == '\n') {
                 if (ch == '\n' && ignored_lf) {
                     ignored_lf = false;
-                    refresh_deadline = make_timeout_time_ms(3000);
+                    refresh_deadline =
+                        make_timeout_time_ms(AUTO_REFRESH_INTERVAL_MS);
                     continue;
                 }
                 ignored_lf = ch == '\r';
-                console_write("\r\n");
                 line[length] = '\0';
+                begin_command_output();
                 execute_line(line);
+                end_command_output();
                 length = 0;
             } else {
                 ignored_lf = false;
@@ -629,17 +821,25 @@ int main(void) {
                         line[length++] = ch;
                         uart_putc_raw(CONSOLE_UART, ch);
                     } else {
-                        console_write("\r\nrejected: command is too long; maximum is 95 characters\r\n");
+                        begin_command_output();
+                        console_write("rejected: command is too long; maximum is 95 characters\r\n");
+                        end_command_output();
                         length = 0;
                     }
                 }
             }
-            refresh_deadline = make_timeout_time_ms(3000);
-        } else if (length == 0 && time_reached(refresh_deadline)) {
-            print_menu(false, true);
-            refresh_deadline = make_timeout_time_ms(3000);
-        } else {
-            tight_loop_contents();
+            refresh_deadline = make_timeout_time_ms(AUTO_REFRESH_INTERVAL_MS);
         }
+        if (time_reached(sample_deadline)) {
+            poll_periodic_sample();
+            sample_deadline = make_timeout_time_ms(SAMPLE_POLL_INTERVAL_MS);
+            did_work = true;
+        }
+        if (length == 0 && time_reached(refresh_deadline)) {
+            print_menu(false, true);
+            refresh_deadline = make_timeout_time_ms(AUTO_REFRESH_INTERVAL_MS);
+            did_work = true;
+        }
+        if (!did_work) tight_loop_contents();
     }
 }

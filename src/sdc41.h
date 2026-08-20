@@ -4,6 +4,8 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+#define SDC41_ADDRESS 0x62u
+
 typedef enum {
     SDC41_OK = 0,
     SDC41_ERR_WRITE,
