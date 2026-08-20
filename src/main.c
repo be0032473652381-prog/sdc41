@@ -24,10 +24,10 @@
 #define SDC41_SAMPLE_PERIOD_SECONDS 5u
 #define SDC41_WARMUP_SECONDS 60u
 #define DISPLAY_VALUE_COLUMN 17u
-#define DISPLAY_PROMPT_ROW 16u
-#define DISPLAY_COMMAND_LIST_FIRST_ROW 17u
-#define DISPLAY_OUTPUT_FIRST_ROW 29u
-#define DISPLAY_OUTPUT_LAST_ROW 36u
+#define DISPLAY_PROMPT_ROW 17u
+#define DISPLAY_COMMAND_LIST_FIRST_ROW 19u
+#define DISPLAY_OUTPUT_FIRST_ROW 31u
+#define DISPLAY_OUTPUT_LAST_ROW 38u
 
 typedef enum { MODE_PERIODIC, MODE_SINGLE } measurement_mode_t;
 typedef enum { SENSOR_ACTIVE, SENSOR_WARMING_UP, SENSOR_OFF } sensor_state_t;
@@ -133,7 +133,7 @@ static void draw_fixed_layout(const char *status, bool thermal_waiting) {
                       ((uint64_t)menu_config.serial_words[1] << 16) |
                       menu_config.serial_words[2];
 
-    console_printf("\x1b[8;36;80t\x1b[2J\x1b[%u;r\x1b[H"
+    console_printf("\x1b[8;38;80t\x1b[2J\x1b[%u;r\x1b[H"
                    "luftfugl sdc41 — SCD41 test harness\r\n",
                    DISPLAY_OUTPUT_FIRST_ROW);
     if (menu_config.serial_result == SDC41_OK)
@@ -152,7 +152,8 @@ static void draw_fixed_layout(const char *status, bool thermal_waiting) {
     console_printf("- offset      = %s\r\n", field_value);
     console_printf("- altitude    = %s\r\n", field_value);
     console_printf("- mode        = %s\r\n", field_value);
-    console_printf("- data ready  = %s\r\nEnter Command > \r\n", field_value);
+    console_printf("- data ready  = %s\r\n\r\nEnter Command > \r\n\r\n",
+                   field_value);
     draw_command_list();
     show_command_prompt();
     command_output_active = false;
@@ -284,16 +285,27 @@ static uint32_t filtered_countdown_seconds(void) {
                              seconds_since_last_raw_sample());
 }
 
+static const char *co2_zone_label(uint16_t co2_ppm) {
+    if (co2_ppm < 600u) return "'Excellent < 600 ppm'";
+    if (co2_ppm < 800u) return "'Good 600–800 ppm'";
+    if (co2_ppm < 1000u) return "'Moderate 800–1,000 ppm'";
+    if (co2_ppm <= 2000u) return "'Poor 1,000–2,000 ppm'";
+    return "'Hazardous > 2,000 ppm'";
+}
+
 static void format_co2_value(char *buffer, size_t size,
                              const menu_snapshot_t *snapshot) {
     if (!snapshot->filtered_co2_available)
         (void)snprintf(buffer, size, "pending - %lu seconds",
                        (unsigned long)filtered_countdown_seconds());
-    else
-        (void)snprintf(buffer, size, "%u ppm - %lu seconds",
-                       (uint16_t)((snapshot->filtered_co2_milli_ppm + 500) /
-                                  1000),
-                       (unsigned long)filtered_countdown_seconds());
+    else {
+        uint16_t co2_ppm =
+            (uint16_t)((snapshot->filtered_co2_milli_ppm + 500) / 1000);
+        (void)snprintf(buffer, size,
+                       "%u ppm - %lu seconds ->>> co2 zone: %s", co2_ppm,
+                       (unsigned long)filtered_countdown_seconds(),
+                       co2_zone_label(co2_ppm));
+    }
 }
 
 static void format_raw_co2_value(char *buffer, size_t size,
