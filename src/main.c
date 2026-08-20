@@ -19,20 +19,37 @@
 #define LINE_CAPACITY 96u
 #define AUTO_REFRESH_INTERVAL_MS 5000u
 #define SAMPLE_POLL_INTERVAL_MS 1000u
+#define COUNTDOWN_REFRESH_INTERVAL_MS 1000u
 #define CO2_FILTER_SAMPLE_COUNT 7u
+#define SDC41_SAMPLE_PERIOD_SECONDS 5u
+#define SDC41_WARMUP_SECONDS 60u
 #define DISPLAY_VALUE_COLUMN 17u
 #define DISPLAY_PROMPT_ROW 16u
-#define DISPLAY_OUTPUT_FIRST_ROW 17u
-#define DISPLAY_OUTPUT_LAST_ROW 24u
+#define DISPLAY_COMMAND_LIST_FIRST_ROW 17u
+#define DISPLAY_OUTPUT_FIRST_ROW 29u
+#define DISPLAY_OUTPUT_LAST_ROW 36u
 
 typedef enum { MODE_PERIODIC, MODE_SINGLE } measurement_mode_t;
+typedef enum { SENSOR_ACTIVE, SENSOR_WARMING_UP, SENSOR_OFF } sensor_state_t;
+typedef void (*command_handler_t)(const char *args);
+
+typedef struct {
+    const char *name;
+    const char *display;
+    const char *example;
+    command_handler_t handler;
+} command_entry_t;
 
 static measurement_mode_t mode = MODE_PERIODIC;
+static sensor_state_t sensor_state = SENSOR_ACTIVE;
+static absolute_time_t warmup_deadline;
+static bool start_periodic_after_warmup;
 static sdc41_measurement_t last_measurement;
 static bool have_measurement;
 static sdc41_result_t last_measurement_result = SDC41_OK;
-static bool last_data_ready;
+static bool data_ready_latched;
 static sdc41_result_t last_ready_result = SDC41_OK;
+static absolute_time_t last_raw_sample_time;
 
 typedef struct {
     uint16_t samples[CO2_FILTER_SAMPLE_COUNT];
@@ -76,6 +93,9 @@ static bool have_last_printed_menu;
 static bool command_output_active;
 static unsigned command_output_row = DISPLAY_OUTPUT_FIRST_ROW;
 
+static void show_command_prompt(void);
+static void draw_command_list(void);
+
 static void console_write(const char *text) {
     uart_puts(CONSOLE_UART, text);
     if (command_output_active) {
@@ -106,35 +126,71 @@ static void format_fixed_milli(char *buffer, size_t size, int32_t value,
                    (unsigned long)(magnitude % 1000u), unit);
 }
 
-static void draw_fixed_layout(void) {
-    console_write("\x1b[2J\x1b[17;r\x1b[H"
-                  "luftfugl sdc41 — SCD41 test harness\r\n"
-                  "\r\n"
-                  "  co2         = \r\n"
-                  "  co2 raw     = \r\n"
-                  "  filter      = \r\n"
-                  "  temperature = \r\n"
-                  "  humidity    = \r\n"
-                  "  serial      = \r\n"
-                  "  asc         = \r\n"
-                  "  offset      = \r\n"
-                  "  altitude    = \r\n"
-                  "  mode        = \r\n"
-                  "  data ready  = \r\n"
-                  "  i2c address = \r\n"
-                  "\r\n"
-                  "> ");
+static void draw_fixed_layout(const char *status, bool thermal_waiting) {
+    static const char waiting[] = "thermal stabilisation waiting";
+    const char *field_value = thermal_waiting ? waiting : "";
+    uint64_t serial = ((uint64_t)menu_config.serial_words[0] << 32) |
+                      ((uint64_t)menu_config.serial_words[1] << 16) |
+                      menu_config.serial_words[2];
+
+    console_printf("\x1b[8;36;80t\x1b[2J\x1b[%u;r\x1b[H"
+                   "luftfugl sdc41 — SCD41 test harness\r\n",
+                   DISPLAY_OUTPUT_FIRST_ROW);
+    if (menu_config.serial_result == SDC41_OK)
+        console_printf("- serial      = %llu\r\n", (unsigned long long)serial);
+    else
+        console_printf("- serial      = error (%s)\r\n",
+                       sdc41_result_string(menu_config.serial_result));
+    console_printf("- i2c address = 0x%02X\r\n\r\n%s\r\n", SDC41_ADDRESS,
+                   status);
+    console_printf("- co2         = %s\r\n", field_value);
+    console_printf("- co2 raw     = %s\r\n", field_value);
+    console_printf("- filter      = %s\r\n", field_value);
+    console_printf("- temperature = %s\r\n", field_value);
+    console_printf("- humidity    = %s\r\n", field_value);
+    console_printf("- asc         = %s\r\n", field_value);
+    console_printf("- offset      = %s\r\n", field_value);
+    console_printf("- altitude    = %s\r\n", field_value);
+    console_printf("- mode        = %s\r\n", field_value);
+    console_printf("- data ready  = %s\r\nEnter Command > \r\n", field_value);
+    draw_command_list();
+    show_command_prompt();
     command_output_active = false;
     command_output_row = DISPLAY_OUTPUT_FIRST_ROW;
 }
 
+static uint32_t warmup_seconds_remaining(void) {
+    int64_t remaining_us =
+        absolute_time_diff_us(get_absolute_time(), warmup_deadline);
+    if (remaining_us <= 0) return 0;
+    return (uint32_t)((remaining_us + 999999) / 1000000);
+}
+
+static void update_warmup_status(void) {
+    console_printf("\x1b" "7\x1b[5;1H\x1b[KSDC41 is Warming up (%lu sec ... "
+                   "counting down to 0)\x1b" "8",
+                   (unsigned long)warmup_seconds_remaining());
+}
+
+static void draw_warmup_layout(void) {
+    char status[80];
+    (void)snprintf(status, sizeof(status),
+                   "SDC41 is Warming up (%lu sec ... counting down to 0)",
+                   (unsigned long)warmup_seconds_remaining());
+    draw_fixed_layout(status, true);
+}
+
+static void draw_off_layout(void) {
+    draw_fixed_layout("SDC41 = OFF", true);
+}
+
 static void update_fixed_field(unsigned row, const char *value) {
-    console_printf("\x1b[s\x1b[%u;%uH\x1b[K%s\x1b[u", row,
+    console_printf("\x1b" "7\x1b[%u;%uH\x1b[K%s\x1b" "8", row,
                    DISPLAY_VALUE_COLUMN, value);
 }
 
 static void show_command_prompt(void) {
-    console_printf("\x1b[%u;1H\x1b[K> ", DISPLAY_PROMPT_ROW);
+    console_printf("\x1b[%u;1H\x1b[KEnter Command > ", DISPLAY_PROMPT_ROW);
 }
 
 static void begin_command_output(void) {
@@ -204,18 +260,80 @@ static uint16_t filtered_co2_ppm(void) {
     return (uint16_t)((co2_filter.ema_milli_ppm + 500) / 1000);
 }
 
+static uint32_t seconds_since_last_raw_sample(void) {
+    int64_t elapsed_us =
+        absolute_time_diff_us(last_raw_sample_time, get_absolute_time());
+    if (elapsed_us <= 0) return 0;
+    return (uint32_t)(elapsed_us / 1000000);
+}
+
+static uint32_t countdown_clamped(uint32_t period_seconds,
+                                  uint32_t elapsed_seconds) {
+    return elapsed_seconds < period_seconds ? period_seconds - elapsed_seconds
+                                            : 0;
+}
+
+static uint32_t raw_countdown_seconds(void) {
+    return countdown_clamped(SDC41_SAMPLE_PERIOD_SECONDS,
+                             seconds_since_last_raw_sample());
+}
+
+static uint32_t filtered_countdown_seconds(void) {
+    uint32_t samples_remaining = CO2_FILTER_SAMPLE_COUNT - co2_filter.count;
+    return countdown_clamped(samples_remaining * SDC41_SAMPLE_PERIOD_SECONDS,
+                             seconds_since_last_raw_sample());
+}
+
+static void format_co2_value(char *buffer, size_t size,
+                             const menu_snapshot_t *snapshot) {
+    if (!snapshot->filtered_co2_available)
+        (void)snprintf(buffer, size, "pending - %lu seconds",
+                       (unsigned long)filtered_countdown_seconds());
+    else
+        (void)snprintf(buffer, size, "%u ppm - %lu seconds",
+                       (uint16_t)((snapshot->filtered_co2_milli_ppm + 500) /
+                                  1000),
+                       (unsigned long)filtered_countdown_seconds());
+}
+
+static void format_raw_co2_value(char *buffer, size_t size,
+                                 const menu_snapshot_t *snapshot) {
+    if (snapshot->measurement_result != SDC41_OK)
+        (void)snprintf(buffer, size, "error (%s) - %lu seconds",
+                       sdc41_result_string(snapshot->measurement_result),
+                       (unsigned long)raw_countdown_seconds());
+    else if (!snapshot->have_measurement)
+        (void)snprintf(buffer, size, "pending - %lu seconds",
+                       (unsigned long)raw_countdown_seconds());
+    else
+        (void)snprintf(buffer, size, "%u ppm - %lu seconds",
+                       snapshot->measurement.co2_ppm,
+                       (unsigned long)raw_countdown_seconds());
+}
+
+static void refresh_countdown_fields(void) {
+    if (sensor_state != SENSOR_ACTIVE || !have_last_printed_menu) return;
+    char value[80];
+    format_co2_value(value, sizeof(value), &last_printed_menu);
+    update_fixed_field(6, value);
+    format_raw_co2_value(value, sizeof(value), &last_printed_menu);
+    update_fixed_field(7, value);
+}
+
 static void accept_measurement(const sdc41_measurement_t *measurement) {
     last_measurement = *measurement;
     have_measurement = true;
     last_measurement_result = SDC41_OK;
-    filter_push(measurement->co2_ppm);
+    data_ready_latched = true;
+    last_raw_sample_time = get_absolute_time();
+    if (sensor_state == SENSOR_ACTIVE) filter_push(measurement->co2_ppm);
 }
 
 static void poll_periodic_sample(void) {
+    if (sensor_state == SENSOR_OFF) return;
     bool ready = false;
     last_ready_result = sdc41_get_ready(&ready);
     if (last_ready_result != SDC41_OK) return;
-    last_data_ready = ready;
     if (!ready) return;
 
     sdc41_measurement_t measurement;
@@ -311,10 +429,13 @@ static void command_ready(const char *args) {
         console_write("rejected: ready takes no arguments; example: ready\r\n");
         return;
     }
+    bool ready = data_ready_latched;
     if (last_ready_result != SDC41_OK)
         print_sensor_error("could not read data-ready status", last_ready_result);
-    else
-        console_printf("data ready: %s\r\n", last_data_ready ? "yes" : "no");
+    else {
+        console_printf("data ready: %s\r\n", ready ? "yes" : "no");
+        if (ready) data_ready_latched = false;
+    }
 }
 
 static void command_serial(const char *args) {
@@ -443,7 +564,7 @@ static void command_status(const char *args) {
         console_write("rejected: status takes no arguments; example: status\r\n");
         return;
     }
-    bool ready = last_data_ready;
+    bool ready = data_ready_latched;
     sdc41_result_t ready_result = last_ready_result;
     bool restart;
     if (!begin_idle_operation("could not stop periodic measurement", &restart)) return;
@@ -459,7 +580,10 @@ static void command_status(const char *args) {
         print_fixed_milli(last_measurement.temperature_milli_c, " C/");
         print_fixed_milli((int32_t)last_measurement.humidity_milli_percent, " %RH");
     } else console_write("none");
-    if (ready_result == SDC41_OK) console_printf(", data ready=%s\r\n", ready ? "yes" : "no");
+    if (ready_result == SDC41_OK) {
+        console_printf(", data ready=%s\r\n", ready ? "yes" : "no");
+        if (ready) data_ready_latched = false;
+    }
     else console_printf(", data ready=error (%s)\r\n", sdc41_result_string(ready_result));
 }
 
@@ -506,7 +630,16 @@ static bool result_value_changed(sdc41_result_t current_result,
 }
 
 static void print_menu(bool refresh_config, bool changed_only) {
-    bool ready = last_data_ready;
+    if (sensor_state == SENSOR_WARMING_UP) {
+        draw_warmup_layout();
+        return;
+    }
+    if (sensor_state == SENSOR_OFF) {
+        draw_off_layout();
+        return;
+    }
+
+    bool ready = data_ready_latched;
     sdc41_result_t ready_result = last_ready_result;
     sdc41_result_t measurement_result = last_measurement_result;
 
@@ -537,7 +670,7 @@ static void print_menu(bool refresh_config, bool changed_only) {
                                          current.measurement.co2_ppm,
                                          last_printed_menu.measurement.co2_ppm);
     bool filter_changed =
-        all || co2_filter.count != last_printed_menu.filter_count;
+        all || current.filter_count != last_printed_menu.filter_count;
     bool temperature_changed =
         all || measurement_field_changed(
                    &current, &last_printed_menu,
@@ -548,28 +681,22 @@ static void print_menu(bool refresh_config, bool changed_only) {
                    &current, &last_printed_menu,
                    (int32_t)current.measurement.humidity_milli_percent,
                    (int32_t)last_printed_menu.measurement.humidity_milli_percent);
+    bool ready_changed =
+        all || result_value_changed(ready_result,
+                                    last_printed_menu.ready_result, ready,
+                                    last_printed_menu.ready);
 
-    if (all) draw_fixed_layout();
+    if (all) draw_fixed_layout("SDC41 active", false);
 
     char value[80];
 
     if (co2_changed) {
-        if (!current.filtered_co2_available)
-            (void)snprintf(value, sizeof(value), "pending");
-        else
-            (void)snprintf(value, sizeof(value), "%u ppm",
-                           filtered_co2_ppm());
-        update_fixed_field(3, value);
+        format_co2_value(value, sizeof(value), &current);
+        update_fixed_field(6, value);
     }
     if (raw_co2_changed) {
-        if (measurement_result != SDC41_OK)
-            format_menu_error(value, sizeof(value), measurement_result);
-        else if (!have_measurement)
-            (void)snprintf(value, sizeof(value), "pending");
-        else
-            (void)snprintf(value, sizeof(value), "%u ppm",
-                           last_measurement.co2_ppm);
-        update_fixed_field(4, value);
+        format_raw_co2_value(value, sizeof(value), &current);
+        update_fixed_field(7, value);
     }
     if (filter_changed) {
         static const char *const progress[CO2_FILTER_SAMPLE_COUNT] = {
@@ -577,7 +704,7 @@ static void print_menu(bool refresh_config, bool changed_only) {
         };
         (void)snprintf(value, sizeof(value), "%s",
                        filter_ready ? "ready" : progress[current.filter_count]);
-        update_fixed_field(5, value);
+        update_fixed_field(8, value);
     }
     if (temperature_changed) {
         if (measurement_result != SDC41_OK)
@@ -587,7 +714,7 @@ static void print_menu(bool refresh_config, bool changed_only) {
         else
             format_fixed_milli(value, sizeof(value),
                                last_measurement.temperature_milli_c, " C");
-        update_fixed_field(6, value);
+        update_fixed_field(9, value);
     }
     if (humidity_changed) {
         if (measurement_result != SDC41_OK)
@@ -598,7 +725,7 @@ static void print_menu(bool refresh_config, bool changed_only) {
             format_fixed_milli(
                 value, sizeof(value),
                 (int32_t)last_measurement.humidity_milli_percent, " %RH");
-        update_fixed_field(7, value);
+        update_fixed_field(10, value);
     }
 
     uint64_t serial = ((uint64_t)menu_config.serial_words[0] << 32) |
@@ -616,7 +743,7 @@ static void print_menu(bool refresh_config, bool changed_only) {
                            (unsigned long long)serial);
         else
             format_menu_error(value, sizeof(value), menu_config.serial_result);
-        update_fixed_field(8, value);
+        update_fixed_field(2, value);
     }
     if (all || result_value_changed(menu_config.asc_result,
                                     last_printed_menu.config.asc_result,
@@ -627,7 +754,7 @@ static void print_menu(bool refresh_config, bool changed_only) {
                            menu_config.asc ? "on" : "off");
         else
             format_menu_error(value, sizeof(value), menu_config.asc_result);
-        update_fixed_field(9, value);
+        update_fixed_field(11, value);
     }
     if (all || result_value_changed(menu_config.offset_result,
                                     last_printed_menu.config.offset_result,
@@ -640,7 +767,7 @@ static void print_menu(bool refresh_config, bool changed_only) {
         } else {
             format_menu_error(value, sizeof(value), menu_config.offset_result);
         }
-        update_fixed_field(10, value);
+        update_fixed_field(12, value);
     }
     if (all || result_value_changed(menu_config.altitude_result,
                                     last_printed_menu.config.altitude_result,
@@ -651,27 +778,98 @@ static void print_menu(bool refresh_config, bool changed_only) {
                            menu_config.altitude);
         else
             format_menu_error(value, sizeof(value), menu_config.altitude_result);
-        update_fixed_field(11, value);
+        update_fixed_field(13, value);
     }
     if (all || mode != last_printed_menu.mode) {
         (void)snprintf(value, sizeof(value), "%s",
                        mode == MODE_PERIODIC ? "periodic" : "single");
-        update_fixed_field(12, value);
+        update_fixed_field(14, value);
     }
-    if (all) {
+    if (ready_changed) {
         if (ready_result == SDC41_OK)
             (void)snprintf(value, sizeof(value), "%s", ready ? "yes" : "no");
         else
             format_menu_error(value, sizeof(value), ready_result);
-        update_fixed_field(13, value);
+        update_fixed_field(15, value);
+        if (ready_result == SDC41_OK && ready) data_ready_latched = false;
     }
     if (all) {
         (void)snprintf(value, sizeof(value), "0x%02X", SDC41_ADDRESS);
-        update_fixed_field(14, value);
+        update_fixed_field(3, value);
     }
 
     last_printed_menu = current;
     have_last_printed_menu = true;
+}
+
+static void reset_measurement_pipeline(void) {
+    memset(&co2_filter, 0, sizeof(co2_filter));
+    memset(&last_measurement, 0, sizeof(last_measurement));
+    have_measurement = false;
+    last_measurement_result = SDC41_OK;
+    data_ready_latched = false;
+    last_ready_result = SDC41_OK;
+    last_raw_sample_time = get_absolute_time();
+    have_last_printed_menu = false;
+}
+
+static void begin_sensor_warmup(void) {
+    sensor_state = SENSOR_WARMING_UP;
+    warmup_deadline = make_timeout_time_ms(SDC41_WARMUP_SECONDS * 1000u);
+    reset_measurement_pipeline();
+}
+
+static void complete_sensor_warmup(void) {
+    reset_measurement_pipeline();
+    if (start_periodic_after_warmup) {
+        sdc41_result_t result = sdc41_start_periodic();
+        start_periodic_after_warmup = false;
+        if (result != SDC41_OK) {
+            sensor_state = SENSOR_OFF;
+            draw_off_layout();
+            begin_command_output();
+            print_sensor_error("could not start periodic measurement", result);
+            end_command_output();
+            return;
+        }
+        mode = MODE_PERIODIC;
+    }
+    sensor_state = SENSOR_ACTIVE;
+    print_menu(false, false);
+}
+
+static void command_sdc41(const char *args) {
+    if (strcmp(args, "off") == 0) {
+        if (sensor_state == SENSOR_OFF) {
+            console_write("rejected: sdc41 already off\r\n");
+            return;
+        }
+        bool restart_periodic;
+        sdc41_result_t result = enter_idle(&restart_periodic);
+        if (result == SDC41_OK) result = sdc41_power_down();
+        if (result != SDC41_OK) {
+            print_sensor_error("could not power down SDC41", result);
+            return;
+        }
+        (void)restart_periodic;
+        start_periodic_after_warmup = false;
+        sensor_state = SENSOR_OFF;
+        reset_measurement_pipeline();
+        draw_off_layout();
+        return;
+    }
+    if (strcmp(args, "on") == 0) {
+        if (sensor_state != SENSOR_OFF) {
+            console_write("rejected: sdc41 already on\r\n");
+            return;
+        }
+        sdc41_wake_up();
+        start_periodic_after_warmup = true;
+        begin_sensor_warmup();
+        draw_warmup_layout();
+        return;
+    }
+    console_write("rejected: sdc41 requires on or off; example: sdc41 off\r\n");
 }
 
 static void command_menu(const char *args) {
@@ -693,6 +891,7 @@ static const char help_text[] =
     "  altitude [metres]   example: altitude 12\r\n"
     "  mode [periodic|single]  example: mode single\r\n"
     "  status              example: status\r\n"
+    "  sdc41 <on|off>      examples: sdc41 on, sdc41 off\r\n"
     "  menu                example: menu\r\n"
     "  help [command]      example: help offset\r\n"
     "note: ambient pressure can be set by the sensor protocol but cannot be read back; this harness has no pressure command.\r\n";
@@ -713,7 +912,8 @@ static void command_help(const char *args) {
         {"altitude", "altitude [metres]: read or set altitude from 0 to 3000 m. Example: altitude 12\r\n"},
         {"mode", "mode [periodic|single]: read or select measurement mode. Example: mode single\r\n"},
         {"status", "status: print mode, ASC, last reading, and data-ready state. Example: status\r\n"},
-        {"menu", "menu: print every readable parameter as key = value lines and refresh cached configuration; changed fields auto-refresh every 3 seconds while the console is idle. Selftest is deliberately excluded. Example: menu\r\n"},
+        {"sdc41", "sdc41 <on|off>: enter sensor power-down or wake it and begin the 60-second warm-up. Examples: sdc41 on, sdc41 off\r\n"},
+        {"menu", "menu: print every readable parameter as key = value lines and refresh cached configuration; changed fields auto-refresh every 5 seconds while the console is idle. Selftest is deliberately excluded. Example: menu\r\n"},
         {"help", "help [command]: list commands or show one command in detail. Example: help offset\r\n"},
     };
     for (size_t i = 0; i < sizeof(details) / sizeof(details[0]); ++i) {
@@ -729,6 +929,33 @@ static void command_help(const char *args) {
     }
 }
 
+static const command_entry_t command_table[] = {
+    {"co2", "co2", "co2", command_co2},
+    {"ready", "ready", "ready", command_ready},
+    {"serial", "serial", "serial", command_serial},
+    {"selftest", "selftest", "selftest", command_selftest},
+    {"asc", "asc [on|off]", "asc off", command_asc},
+    {"offset", "offset [degrees]", "offset 4.5", command_offset},
+    {"altitude", "altitude [metres]", "altitude 12", command_altitude},
+    {"mode", "mode [periodic|single]", "mode single", command_mode},
+    {"status", "status", "status", command_status},
+    {"sdc41", "sdc41 <on|off>", "sdc41 off", command_sdc41},
+    {"menu", "menu", "menu", command_menu},
+    {"help", "help [command]", "help offset", command_help},
+};
+
+_Static_assert(sizeof(command_table) / sizeof(command_table[0]) ==
+                   DISPLAY_OUTPUT_FIRST_ROW - DISPLAY_COMMAND_LIST_FIRST_ROW,
+               "command list rows must end immediately before output");
+
+static void draw_command_list(void) {
+    for (size_t i = 0; i < sizeof(command_table) / sizeof(command_table[0]);
+         ++i) {
+        console_printf("  %-24s example: %s\r\n", command_table[i].display,
+                       command_table[i].example);
+    }
+}
+
 static void execute_line(char *line) {
     while (isspace((unsigned char)*line)) ++line;
     char *end = line + strlen(line);
@@ -741,18 +968,15 @@ static void execute_line(char *line) {
         while (isspace((unsigned char)*args)) ++args;
     }
 
-    if (strcmp(line, "co2") == 0) command_co2(args);
-    else if (strcmp(line, "ready") == 0) command_ready(args);
-    else if (strcmp(line, "serial") == 0) command_serial(args);
-    else if (strcmp(line, "selftest") == 0) command_selftest(args);
-    else if (strcmp(line, "asc") == 0) command_asc(args);
-    else if (strcmp(line, "offset") == 0) command_offset(args);
-    else if (strcmp(line, "altitude") == 0) command_altitude(args);
-    else if (strcmp(line, "mode") == 0) command_mode(args);
-    else if (strcmp(line, "status") == 0) command_status(args);
-    else if (strcmp(line, "menu") == 0) command_menu(args);
-    else if (strcmp(line, "help") == 0) command_help(args);
-    else console_printf("rejected: unknown command '%s'; type help for examples\r\n", line);
+    for (size_t i = 0; i < sizeof(command_table) / sizeof(command_table[0]);
+         ++i) {
+        if (strcmp(line, command_table[i].name) == 0) {
+            command_table[i].handler(args);
+            return;
+        }
+    }
+    console_printf("rejected: unknown command '%s'; type help for examples\r\n",
+                   line);
 }
 
 static void console_init(void) {
@@ -780,9 +1004,15 @@ int main(void) {
     sdc41_result_t result = sdc41_start_periodic();
     if (result == SDC41_OK) {
         console_write("mode: periodic measurement started\r\n");
+        start_periodic_after_warmup = false;
+        begin_sensor_warmup();
+        refresh_menu_config();
+        draw_warmup_layout();
     }
-    else print_sensor_error("could not start periodic measurement", result);
-    print_menu(true, false);
+    else {
+        print_sensor_error("could not start periodic measurement", result);
+        print_menu(true, false);
+    }
 
     char line[LINE_CAPACITY];
     size_t length = 0;
@@ -791,6 +1021,8 @@ int main(void) {
         make_timeout_time_ms(AUTO_REFRESH_INTERVAL_MS);
     absolute_time_t sample_deadline =
         make_timeout_time_ms(SAMPLE_POLL_INTERVAL_MS);
+    absolute_time_t countdown_deadline =
+        make_timeout_time_ms(COUNTDOWN_REFRESH_INTERVAL_MS);
     while (true) {
         bool did_work = false;
         if (uart_is_readable(CONSOLE_UART)) {
@@ -835,7 +1067,23 @@ int main(void) {
             sample_deadline = make_timeout_time_ms(SAMPLE_POLL_INTERVAL_MS);
             did_work = true;
         }
-        if (length == 0 && time_reached(refresh_deadline)) {
+        if (sensor_state == SENSOR_WARMING_UP &&
+            time_reached(warmup_deadline)) {
+            complete_sensor_warmup();
+            refresh_deadline = make_timeout_time_ms(AUTO_REFRESH_INTERVAL_MS);
+            did_work = true;
+        }
+        if (time_reached(countdown_deadline)) {
+            if (sensor_state == SENSOR_WARMING_UP)
+                update_warmup_status();
+            else
+                refresh_countdown_fields();
+            countdown_deadline =
+                make_timeout_time_ms(COUNTDOWN_REFRESH_INTERVAL_MS);
+            did_work = true;
+        }
+        if (sensor_state == SENSOR_ACTIVE && length == 0 &&
+            time_reached(refresh_deadline)) {
             print_menu(false, true);
             refresh_deadline = make_timeout_time_ms(AUTO_REFRESH_INTERVAL_MS);
             did_work = true;

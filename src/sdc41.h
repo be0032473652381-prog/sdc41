@@ -24,6 +24,8 @@ void sdc41_init(void);
 const char *sdc41_result_string(sdc41_result_t result);
 sdc41_result_t sdc41_start_periodic(void);
 sdc41_result_t sdc41_stop_periodic(void);
+sdc41_result_t sdc41_power_down(void);
+void sdc41_wake_up(void);
 sdc41_result_t sdc41_measure_single_shot(void);
 sdc41_result_t sdc41_read_measurement(sdc41_measurement_t *measurement);
 sdc41_result_t sdc41_get_ready(bool *ready);

@@ -23,7 +23,9 @@ enum {
     CMD_GET_READY = 0xe4b8,
     CMD_GET_SERIAL = 0x3682,
     CMD_SELF_TEST = 0x3639,
-    CMD_SINGLE_SHOT = 0x219d
+    CMD_SINGLE_SHOT = 0x219d,
+    CMD_POWER_DOWN = 0x36e0,
+    CMD_WAKE_UP = 0x36f6
 };
 
 static sdc41_result_t write_command(uint16_t command) {
@@ -98,6 +100,18 @@ sdc41_result_t sdc41_start_periodic(void) {
 
 sdc41_result_t sdc41_stop_periodic(void) {
     return write_command(CMD_STOP_PERIODIC);
+}
+
+sdc41_result_t sdc41_power_down(void) {
+    return write_command(CMD_POWER_DOWN);
+}
+
+void sdc41_wake_up(void) {
+    const uint8_t bytes[2] = {(uint8_t)(CMD_WAKE_UP >> 8),
+                              (uint8_t)CMD_WAKE_UP};
+    (void)i2c_write_blocking_until(SDC41_I2C, SDC41_ADDRESS, bytes,
+                                   sizeof(bytes), false,
+                                   make_timeout_time_ms(50));
 }
 
 sdc41_result_t sdc41_measure_single_shot(void) {
